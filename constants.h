@@ -7,6 +7,8 @@ namespace nr2{
         ReassignOrder,          // AP → nó órfão: ordem de realocação para novo cluster
         NewLeaderElection,      // AP → cluster: ordem de re-eleição de líder
         // Ataque UDP Flood
-        FloodPacket             // Pacote de ataque UDP flood (insider threat)
+        FloodPacket,            // Pacote de ataque UDP flood (insider threat)
+        // Pipeline de defesa contra atacante (Fase 2)
+        QuarantineOrder         // AP → líder: ordem de quarentena de uma origem suspeita
     };
 }

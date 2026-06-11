@@ -9,10 +9,15 @@
 #include "constants.h"
 
 #include <memory>
+#include <sstream>
 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("Contaski_V1_Nodes");
+
+// Definição do threshold de saturação (estático, compartilhado entre todos os nós).
+// Configurável via NodeApplication::setFloodSaturationThreshold (CLI em contaski.cc).
+uint64_t nr2::NodeApplication::FLOOD_SATURATION_THRESHOLD = 500;
 
 namespace nr2{
 
@@ -91,6 +96,7 @@ namespace nr2{
         this->floodAttack = nullptr;
         this->isCompromised = false;
         this->attackStartTime = 0.0;
+        this->totalFloodReceived = 0;
     }
 
     TypeId NodeApplication::GetTypeId(){
@@ -156,6 +162,18 @@ namespace nr2{
             uint8_t *buffer = new uint8_t[packet->GetSize()];
 	  	    packet->CopyData (buffer, packet->GetSize());
 
+            // Fase 2 — quarentena local: dropar pacotes de origens bloqueadas
+            // antes de qualquer processamento. Ordens vindas do AP (QuarantineOrder)
+            // ainda devem passar — assumimos que o AP não está em blocklist.
+            if (this->quarantinedSources.count(fromIP) > 0 &&
+                tag.GetSimpleValue() != MessageTypes::QuarantineOrder) {
+                delete[] buffer;
+                continue;
+            }
+
+            // Contador de tráfego entrante por origem (consumido pelo líder no heartbeat).
+            this->incomingPacketCount[fromIP]++;
+
             switch (tag.GetSimpleValue()){
                 case MessageTypes::Beacon:{
                     string s = string(buffer, buffer+packet->GetSize());
@@ -194,8 +212,40 @@ namespace nr2{
                 }
                 
                 case MessageTypes::FloodPacket:
-                    // Pacote de flood recebido: ignorar
+                    // Pacote de flood recebido — já foi contabilizado em
+                    // incomingPacketCount (para Z-score do AnomalyDetector).
+                    // Modelo de saturação: se ESTE nó é líder e o total acumulado
+                    // de FloodPackets ultrapassa o threshold, simula a sobrecarga
+                    // do hardware (NS-3 não modela exaustão de recurso por default)
+                    // e marca o líder como morto. Membros saudáveis do cluster
+                    // viram órfãos e entram no pipeline de recuperação do synapt
+                    // (REALLOCATE/RECLUSTER no AP::processOrphansIntuitively).
+                    if(this->isLeader){
+                        this->totalFloodReceived++;
+                        if(this->totalFloodReceived >= FLOOD_SATURATION_THRESHOLD){
+                            NS_LOG_INFO("LEADER_DOWN: " << this->GetNodeIpAddress()
+                                        << " saturado por flood (recv=" << this->totalFloodReceived
+                                        << " >= threshold=" << FLOOD_SATURATION_THRESHOLD
+                                        << ") at t=" << Simulator::Now().GetSeconds());
+                            this->alive = false;
+                            if(this->floodAttack) this->floodAttack->stop();
+                            delete[] buffer;
+                            return;
+                        }
+                    }
                     break;
+
+                case MessageTypes::QuarantineOrder:{
+                    // AP → líder: ordem de quarentena de uma origem suspeita.
+                    // Payload: representação textual do IPv6 alvo (Ipv6Address::Print()).
+                    if (!this->isLeader) break;  // só líderes aplicam quarentena
+                    std::string targetStr = std::string((char*)buffer);
+                    Ipv6Address target(targetStr.c_str());
+                    this->quarantineSource(target);
+                    NS_LOG_INFO("N: QUARANTINE applied by leader " << this->GetNodeIpAddress()
+                                << " on " << target << " (ordered by AP)");
+                    break;
+                }
 
                 default:
                     break;
@@ -514,14 +564,27 @@ namespace nr2{
     void NodeApplication::sendHeartbeat(){
         if(!this->alive || !this->isLeader) return;
 
-        // Enviar heartbeat ao AP com informação do cluster
-        // Formato: "currentMembers,initialMembers"
+        // Heartbeat ao AP — formato estendido (Fase 2):
+        //   "currentMembers,initialMembers|src1=cnt1;src2=cnt2;..."
+        // A parte após o '|' lista pacotes recebidos por origem desde o último
+        // heartbeat. Usamos '=' como separador entre IP e contagem porque IPv6
+        // contém ':' (não pode ser usado como delimitador).
         uint32_t currentMembers = this->clusterList ? this->clusterList->size() : 0;
-        // O tamanho inicial é o mesmo que o atual (fixo após formação)
-        std::string data = std::to_string(currentMembers) + "," + std::to_string(currentMembers);
+        std::stringstream ss;
+        ss << currentMembers << "," << currentMembers << "|";
+        bool first = true;
+        for (const auto& e : this->incomingPacketCount) {
+            if (!first) ss << ";";
+            ss << e.first << "=" << e.second;
+            first = false;
+        }
+        std::string data = ss.str();
 
         this->sendMessageHelper(MessageTypes::HeartbeatReport, this->apAddress,
                                 (uint8_t*)data.c_str(), data.size() + 1);
+
+        // Reset por intervalo — próxima janela parte de zero.
+        this->incomingPacketCount.clear();
 
         // Reagendar próximo heartbeat
         Simulator::Schedule(Seconds(this->heartbeatInterval), &NodeApplication::sendHeartbeat, this);
@@ -540,6 +603,12 @@ namespace nr2{
     void NodeApplication::addClusterMember(Ipv6Address member){
         if(this->clusterList){
             (*this->clusterList)[member] = 0;
+        }
+    }
+
+    void NodeApplication::removeClusterMember(Ipv6Address member){
+        if(this->clusterList){
+            this->clusterList->erase(member);
         }
     }
 
@@ -613,6 +682,23 @@ namespace nr2{
         } else {
             target = this->myLeader;
             role = "MEMBER";
+        }
+
+        // Verificação local pré-ataque (atacante "consciente"):
+        //   Sanity check mínimo: o nó comprometido só ataca se o resultado da
+        //   sua eleição local for um líder concreto (não-degenerado). Não tenta
+        //   distinguir cluster ativo de cluster real-idle — essa distinção não
+        //   é observável localmente, e clusters idle são fenômeno normal do
+        //   protocolo (presente em sectional e synapt). Atacante cujo target é
+        //   ghost-leader registrado-zero não é filtrado aqui; será reportado
+        //   nas métricas como "ataque sem efeito observado pelo AP" (analogia
+        //   direta com cluster idle que não conclui tarefa em sectional/synapt).
+        if(!this->isLeader){
+            if(target == Ipv6Address::GetAny() || target == this->GetNodeIpAddress()){
+                NS_LOG_INFO("FLOOD_ABORT: " << this->GetNodeIpAddress()
+                            << " (MEMBER) — sem líder válido (target=" << target << ")");
+                return;
+            }
         }
 
         NS_LOG_INFO("FLOOD_TRIGGER: Node " << this->GetNodeIpAddress()

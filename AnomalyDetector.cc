@@ -1,4 +1,5 @@
 #include "AnomalyDetector.h"
+#include "IntuitiveLearning.h"   // ATTACKER_Z_LOW / ATTACKER_Z_HIGH
 
 namespace nr2 {
 
@@ -16,25 +17,8 @@ namespace nr2 {
         }
     }
 
-    // double AnomalyDetector::zScore(double value, double mean, double stddev) {
-    //     if (stddev < 1e-10) return 0.0;
-    //     return std::abs(value - mean) / stddev;
-    // }
-
     double AnomalyDetector::zScore(double value, double mean, double stddev) {
-        // Se a rede está perfeitamente determinística (stddev quase 0)
-        if (stddev < 1e-10) {
-            // Verifica se o valor mudou em relação à média.
-            // Se o valor continuou igual à média, não há anomalia.
-            if (std::abs(value - mean) < 1e-10) {
-                return 0.0; 
-            } else {
-                // Se o valor mudou (ex: heartbeat pulou de 5s para 10s),
-                // é uma anomalia extrema! Retornamos um score alto.
-                return 10.0; 
-            }
-        }
-        // Cálculo normal do Z-Score se houver variância
+        if (stddev < 1e-10) return 0.0;
         return std::abs(value - mean) / stddev;
     }
 
@@ -141,6 +125,73 @@ namespace nr2 {
         }
 
         return anomalous;
+    }
+
+    // ============================================================
+    // Fase 2 — detecção de UDP flooder (dual: Z-score + threshold absoluto)
+    // ============================================================
+    std::map<Ipv6Address, double> AnomalyDetector::detectFlooders(
+            const std::map<Ipv6Address, std::map<Ipv6Address, uint32_t>>& leaderSourceCounts) const {
+        // Threshold absoluto: pacotes recebidos por origem em uma janela de 5s
+        // que claramente indica flood. Baseline normal de um membro IIoT é
+        // ~0-20 pkts/janela (beacons + ocasional task response). 100 = 20pkts/s
+        // sustentado, alto o suficiente pra ser suspeito mesmo num cluster
+        // tomado por múltiplos atacantes (cenário em que Z-score colapsa).
+        constexpr double ABSOLUTE_FLOOD_THRESHOLD = 100.0;
+
+        std::map<Ipv6Address, double> suspects;
+
+        for (const auto& leaderEntry : leaderSourceCounts) {
+            const Ipv6Address& leader = leaderEntry.first;
+            const auto& sources = leaderEntry.second;
+
+            // Coletar contagens excluindo o próprio líder
+            std::vector<double> counts;
+            std::vector<Ipv6Address> sourceList;
+            counts.reserve(sources.size());
+            sourceList.reserve(sources.size());
+            for (const auto& s : sources) {
+                if (s.first == leader) continue;       // auto-tráfego não entra no baseline
+                counts.push_back((double)s.second);
+                sourceList.push_back(s.first);
+            }
+
+            // Detector absoluto (independente de tamanho do cluster).
+            // Score sintético: mapeia (count / threshold) para faixa do Z-score
+            // pra que stateFromZScore() categorize coerentemente.
+            //   count == THRESHOLD  → score = ATTACKER_Z_LOW
+            //   count == 2*THRESHOLD → score = 2 * ATTACKER_Z_LOW
+            for (size_t i = 0; i < counts.size(); i++) {
+                if (counts[i] >= ABSOLUTE_FLOOD_THRESHOLD) {
+                    double absScore = (counts[i] / ABSOLUTE_FLOOD_THRESHOLD) * ATTACKER_Z_LOW;
+                    auto it = suspects.find(sourceList[i]);
+                    if (it == suspects.end() || absScore > it->second) {
+                        suspects[sourceList[i]] = absScore;
+                    }
+                }
+            }
+
+            // Cluster muito pequeno (<3 origens): só o detector absoluto vale,
+            // Z-score não é significativo. Já foi tratado acima.
+            if (counts.size() < 3) continue;
+
+            // Detector Z-score relativo (sensível a outliers no cluster normal).
+            auto [mean, stddev] = meanStd(counts);
+            if (stddev < 1e-6) continue;  // sem dispersão → nada relativo suspeito
+
+            for (size_t i = 0; i < counts.size(); i++) {
+                double z = (counts[i] - mean) / stddev;
+                if (z >= ATTACKER_Z_LOW) {
+                    // Score: max entre Z relativo e Z absoluto já registrado
+                    auto it = suspects.find(sourceList[i]);
+                    if (it == suspects.end() || z > it->second) {
+                        suspects[sourceList[i]] = z;
+                    }
+                }
+            }
+        }
+
+        return suspects;
     }
 
 } // namespace nr2

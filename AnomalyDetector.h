@@ -50,6 +50,24 @@ namespace nr2 {
         // Obter scores de anomalia (maior = mais anômalo)
         std::map<Ipv6Address, double> getScores() const { return lastScores; }
 
+        // ============================================================
+        // Fase 2 — detective: detecção de UDP flooder
+        // ============================================================
+        // Para cada cluster (chaveado pelo líder), recebe os contadores de pacotes
+        // por origem observados no último ciclo. Retorna {origem → z-score} para
+        // origens cujo z >= zThreshold dentro do baseline do próprio cluster.
+        // Ignora a contagem do próprio líder (auto-tráfego não conta).
+        //
+        // Detecção dual:
+        //   (1) Z-score relativo intra-cluster (sensível a outliers em cluster
+        //       estatisticamente normal)
+        //   (2) Threshold absoluto de pacotes (fallback quando proporção de
+        //       atacantes é alta o suficiente pra colapsar o Z-score — média
+        //       arrastada pra cima reduz Z dos próprios atacantes)
+        // União dos dois conjuntos é retornada. Score = max(zRelativo, zSintético).
+        std::map<Ipv6Address, double> detectFlooders(
+            const std::map<Ipv6Address, std::map<Ipv6Address, uint32_t>>& leaderSourceCounts) const;
+
     private:
         // Calcular Z-score de um valor em relação à média/desvpad
         static double zScore(double value, double mean, double stddev);

@@ -46,33 +46,14 @@ namespace nr2{
         this->dispatchedTasks = new taskVector();
 
         this->confirmationsSinceLastDispatch = 0;
-        this->failurePercentage = 0.0;
-        this->failurePercentageMin = 0.0;
-        this->failurePercentageMax = 0.0;
-        this->failureTimeMin = 310.0;  // Default: 310s
-        this->failureTimeMax = 310.0;  // Default: 310s (tempo fixo)
-        this->actualFailureTime = 0.0;
-        this->actualFailurePercentage = 0.0;
 
         this->totalNetworkNodes = 0;
         this->decisionInterval = 60.0;  // Ciclo de decisão a cada 60 segundos
         this->allNodesRegistered = false;
 
-        // Cenário 4: Múltiplas falhas sequenciais
-        this->multipleFailuresEnabled = false;
-        this->multipleFailurePercentage = 0.0;
-        this->currentFailureWave = 0;
-
         // Inicializar módulos do aprendizado intuitivo
         this->intuitiveEngine = new IntuitiveLearningEngine();
         this->anomalyDetector = new AnomalyDetector(2.0, 20);  // Z-threshold=2.0, janela=20
-
-        // Configuração de ataque (default: sem ataque)
-        this->attackNAttackers = 0;
-        this->attackStartTime = 300.0;
-        this->attackRate = 50.0;
-        this->attackPayloadSize = 64;
-        this->attackMode = 1;
 
         for(auto task:*this->tasks){
             task->print();
@@ -80,6 +61,18 @@ namespace nr2{
     }
 
     void NodeAPApplication::StartApplication(){
+        // Override combinado por densidade da rede para N>=300. Ver IntuitiveLearning.h
+        // (XI_ANOMALOUS_300, THRESHOLD_S1_300) para a justificativa detalhada:
+        //   (i)  ξ_anomalous=-0.033 reduz o drag absoluto sobre mean(Li) (paper-citado)
+        //   (ii) THRESHOLD_S1=0.245 recalibra o gatilho S1/S2 (hyperparâmetro interno)
+        if(this->totalNetworkNodes >= 300){
+            this->intuitiveEngine->getDistributedLearning().setXiAnomalous(XI_ANOMALOUS_300);
+            this->intuitiveEngine->getDualSystemMut().setThresholdS1(THRESHOLD_S1_300);
+            NS_LOG_INFO("DENSITY_OVERRIDE: N=" << this->totalNetworkNodes
+                        << " → ξ_anomalous=" << XI_ANOMALOUS_300
+                        << ", THRESHOLD_S1=" << THRESHOLD_S1_300);
+        }
+
         // If socket is not created yet
         if(!this->m_socket){
             // Create socket
@@ -102,63 +95,10 @@ namespace nr2{
             this->intuitiveEngine->loadKnowledge(this->knowledgePath);
         }
 
-        // Calcular tempo e porcentagem de falha (pode ser fixo ou aleatório)
-        // Usa RNG do NS-3 para reprodutibilidade via seed+run
-        Ptr<UniformRandomVariable> failRng = CreateObject<UniformRandomVariable>();
-
-        // Determinar tempo de falha
-        if(this->failureTimeMin < this->failureTimeMax){
-            // Tempo aleatório entre min e max
-            failRng->SetAttribute("Min", DoubleValue(this->failureTimeMin));
-            failRng->SetAttribute("Max", DoubleValue(this->failureTimeMax));
-            this->actualFailureTime = failRng->GetValue();
-        } else {
-            // Tempo fixo
-            this->actualFailureTime = this->failureTimeMin;
-        }
-
-        // Determinar porcentagem de falha
-        if(this->failurePercentageMin > 0 && this->failurePercentageMin < this->failurePercentageMax){
-            // Porcentagem aleatória entre min e max
-            failRng->SetAttribute("Min", DoubleValue(this->failurePercentageMin));
-            failRng->SetAttribute("Max", DoubleValue(this->failurePercentageMax));
-            this->actualFailurePercentage = failRng->GetValue();
-        } else if(this->failurePercentage > 0){
-            // Porcentagem fixa
-            this->actualFailurePercentage = this->failurePercentage;
-        } else {
-            this->actualFailurePercentage = 0.0;
-        }
-
-        // Agendar falhas se houver porcentagem configurada
-        if(this->multipleFailuresEnabled){
-            // Cenário 4: Múltiplas falhas sequenciais
-            NS_LOG_INFO("FAILURE_CONFIG: Modo múltiplas falhas ativado — "
-                        << this->failureTimes.size() << " ondas de falha, "
-                        << this->multipleFailurePercentage << "% cada");
-            for(size_t i = 0; i < this->failureTimes.size(); i++){
-                NS_LOG_INFO("FAILURE_CONFIG: Onda " << (i+1) << " agendada para t=" << this->failureTimes[i] << "s");
-                Simulator::Schedule(Seconds(this->failureTimes[i]),
-                                    &NodeAPApplication::triggerMultipleFailureWave, this);
-            }
-        }
-        else if(this->actualFailurePercentage > 0.0){
-            NS_LOG_INFO("FAILURE_CONFIG: Tempo=" << this->actualFailureTime << "s, Porcentagem=" << this->actualFailurePercentage << "%");
-            Simulator::Schedule(Seconds(this->actualFailureTime), &NodeAPApplication::triggerLeaderFailures, this);
-        }
-
-        // ============================================================
-        // Agendar seleção de atacantes pós-clustering (se configurado)
-        // ============================================================
-        if(this->attackNAttackers > 0){
-            Simulator::Schedule(Seconds(200.0), &NodeAPApplication::selectAndConfigureAttackers, this);
-        }
-
         // ============================================================
         // Agendar primeiro ciclo de decisão do aprendizado intuitivo
-        // Começa após a formação dos clusters (~150s) + margem
-        // ============================================================
-        Simulator::Schedule(Seconds(200.0), &NodeAPApplication::intuitiveDecisionCycle, this);
+        // Líderes registram em t=105s; ciclo começa em t=115s (antes do primeiro dispatch em t=150s)
+        Simulator::Schedule(Seconds(160.0), &NodeAPApplication::intuitiveDecisionCycle, this);
     }
 
     void NodeAPApplication::StopApplication(){
@@ -326,12 +266,78 @@ namespace nr2{
                     if(it != clusterInfoMap.end()){
                         it->second.lastHeartbeat = Simulator::Now().GetSeconds();
                     }
+
+                    // Fase 2 — parsing do formato estendido com defesa em camadas:
+                    //   "members,initialMembers|src1=cnt1;src2=cnt2;..."
+                    // Tolerante a payload mal-formado: null bytes, tokens vazios,
+                    // IPs inválidos, números não-parseáveis, pipe ausente. Em
+                    // qualquer falha por payload, o entry vira map vazio (não
+                    // crash). Log uma vez por líder pra alertar sem flood.
+                    uint32_t psize = packet->GetSize();
+                    if (psize == 0) break;  // payload vazio: ignora
+                    std::vector<uint8_t> buf(psize);
+                    packet->CopyData(buf.data(), psize);
+                    std::string payload((char*)buf.data(), psize);
+                    // Sanitiza terminador nulo final se presente
+                    while (!payload.empty() && payload.back() == '\0') payload.pop_back();
+
+                    size_t pipePos = payload.find('|');
+                    std::map<Ipv6Address, uint32_t> srcMap;
+
+                    if (pipePos == std::string::npos) {
+                        // Heartbeat legado (sem contadores) — aceita, srcMap vazio
+                        NS_LOG_DEBUG("HEARTBEAT_PARSE: " << fromIP
+                                     << " sem '|' (formato legado, sem contadores)");
+                    } else if (pipePos + 1 < payload.size()) {
+                        std::string countsStr = payload.substr(pipePos + 1);
+                        std::stringstream ss(countsStr);
+                        std::string token;
+                        int parsedOk = 0, parsedBad = 0;
+                        while (std::getline(ss, token, ';')) {
+                            // Filtrar caracteres residuais
+                            while (!token.empty() && (token.back() == '\0' || token.back() == '\r' ||
+                                                       token.back() == ' '  || token.back() == '\n'))
+                                token.pop_back();
+                            if (token.empty()) continue;
+                            size_t eq = token.find('=');
+                            if (eq == std::string::npos || eq == 0 || eq == token.size()-1) {
+                                parsedBad++;
+                                continue;  // separador mal-posicionado
+                            }
+                            std::string ipStr = token.substr(0, eq);
+                            std::string cntStr = token.substr(eq + 1);
+                            // Validar IPv6 minimamente: precisa ter ':'
+                            if (ipStr.find(':') == std::string::npos) {
+                                parsedBad++;
+                                continue;
+                            }
+                            // Validar contador: deve ser todo numérico
+                            bool allDigits = !cntStr.empty();
+                            for (char c : cntStr) {
+                                if (c < '0' || c > '9') { allDigits = false; break; }
+                            }
+                            if (!allDigits) {
+                                parsedBad++;
+                                continue;
+                            }
+                            try {
+                                Ipv6Address src(ipStr.c_str());
+                                uint32_t cnt = (uint32_t)std::stoul(cntStr);
+                                srcMap[src] = cnt;
+                                parsedOk++;
+                            } catch (const std::exception&) {
+                                parsedBad++;
+                            }
+                        }
+                        if (parsedBad > 0) {
+                            NS_LOG_INFO("HEARTBEAT_PARSE: " << fromIP
+                                        << " ok=" << parsedOk << " bad=" << parsedBad
+                                        << " (payload parcialmente corrompido — manter pares válidos)");
+                        }
+                    }
+                    leaderSourceCounts[fromIP] = srcMap;
                     break;
                 }
-
-                case MessageTypes::FloodPacket:
-                    // Pacote de flood chegou ao AP: ignorar
-                    break;
 
                 default:
                     break;
@@ -367,20 +373,6 @@ namespace nr2{
         this->tasks = tasks;
     }
 
-    void NodeAPApplication::setFailurePercentage(double percentage){
-        this->failurePercentage = percentage;
-    }
-
-    void NodeAPApplication::setFailurePercentageRange(double min, double max){
-        this->failurePercentageMin = min;
-        this->failurePercentageMax = max;
-    }
-
-    void NodeAPApplication::setFailureTimeRange(double min, double max){
-        this->failureTimeMin = min;
-        this->failureTimeMax = max;
-    }
-
     void NodeAPApplication::setNodes(NodeContainer nodes){
         this->networkNodes = nodes;
     }
@@ -399,259 +391,7 @@ namespace nr2{
         return nullptr;
     }
 
-    void NodeAPApplication::setMultipleFailures(std::vector<double> times, double percentage){
-        this->multipleFailuresEnabled = true;
-        this->failureTimes = times;
-        this->multipleFailurePercentage = percentage;
-        this->currentFailureWave = 0;
-    }
-
-    void NodeAPApplication::triggerMultipleFailureWave(){
-        this->currentFailureWave++;
-        double now = Simulator::Now().GetSeconds();
-        
-        NS_LOG_INFO("FAILURE_WAVE: === Onda " << this->currentFailureWave 
-                    << " de " << this->failureTimes.size() 
-                    << " no tempo " << now << "s ===");
-
-        // Recalcular líderes aptos AGORA (vivos + com cluster real)
-        // Diferente do cenário original que usa aptLeaders acumulados desde o início,
-        // aqui precisamos verificar quem está VIVO e ATIVO neste momento
-        std::vector<Ipv6Address> currentEligibleLeaders;
-
-        for(const auto& entry : clusterInfoMap){
-            if(!entry.second.leaderAlive) continue;
-
-            Ipv6Address leaderAddr = entry.first;
-            Ptr<Node> leaderNode = findNodeByAddress(this->networkNodes, leaderAddr);
-            if(!leaderNode) continue;
-            
-            Ptr<NodeApplication> leaderApp = DynamicCast<NodeApplication>(
-                leaderNode->GetApplication(0));
-            if(!leaderApp || !leaderApp->isNodeAlive()) continue;
-
-            // Contar membros reais: nós vivos cujo myLeader é este líder (excluindo o próprio)
-            int realMembers = 0;
-            for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
-                Ptr<Node> n = this->networkNodes.Get(j);
-                Ptr<NodeApplication> nApp = DynamicCast<NodeApplication>(
-                    n->GetApplication(0));
-                if(!nApp || !nApp->isNodeAlive()) continue;
-                if(nApp->getMyLeader() == leaderAddr && 
-                   nApp->GetNodeIpAddress() != leaderAddr){
-                    realMembers++;
-                }
-            }
-
-            if(realMembers > 0){
-                currentEligibleLeaders.push_back(leaderAddr);
-                NS_LOG_INFO("FAILURE_WAVE_ELIGIBLE: Leader " << leaderAddr 
-                            << " with " << realMembers << " real members"
-                            << " (clusterList size=" << leaderApp->getClusterSize() << ")");
-            } else {
-                NS_LOG_INFO("FAILURE_WAVE_SKIPPED: Leader " << leaderAddr 
-                            << " has 0 real members (too small)");
-            }
-        }
-
-        if(currentEligibleLeaders.empty()){
-            NS_LOG_INFO("FAILURE_WAVE: Nenhum líder elegível na onda " 
-                        << this->currentFailureWave);
-            return;
-        }
-
-        // Calcular quantos líderes irão falhar (30% dos elegíveis AGORA)
-        int totalEligible = currentEligibleLeaders.size();
-        int leadersToFail = (int)std::ceil(totalEligible * this->multipleFailurePercentage / 100.0);
-        
-        if(leadersToFail == 0 && this->multipleFailurePercentage > 0){
-            leadersToFail = 1;
-        }
-
-        NS_LOG_INFO("FAILURE_WAVE: " << leadersToFail << " de " << totalEligible 
-                    << " líderes elegíveis irão falhar (" 
-                    << this->multipleFailurePercentage << "%)");
-
-        // Embaralhar para seleção aleatória
-        Ptr<UniformRandomVariable> shuffleRng = CreateObject<UniformRandomVariable>();
-        std::vector<Ipv6Address> shuffled = currentEligibleLeaders;
-        // Fisher-Yates usando RNG do NS-3 (determinístico via seed+run)
-        for(int i = shuffled.size() - 1; i > 0; i--){
-            shuffleRng->SetAttribute("Min", DoubleValue(0));
-            shuffleRng->SetAttribute("Max", DoubleValue(i + 0.999));
-            int j = (int)shuffleRng->GetValue();
-            if(j > i) j = i;
-            std::swap(shuffled[i], shuffled[j]);
-        }
-
-        // Aplicar falhas
-        int totalRealOrphans = 0;
-        for(int i = 0; i < leadersToFail; i++){
-            Ipv6Address leaderToFail = shuffled[i];
-
-            Ptr<Node> node = findNodeByAddress(this->networkNodes, leaderToFail);
-            if(!node) continue;
-
-            Ptr<Application> app = node->GetApplication(0);
-            if(!app) continue;
-
-            Ptr<NodeApplication> nodeApp = DynamicCast<NodeApplication>(app);
-            if(!nodeApp) continue;
-
-            // Contar órfãos reais: nós vivos cujo myLeader é este líder (excluindo o próprio)
-            int realOrphans = 0;
-            for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
-                Ptr<Node> n = this->networkNodes.Get(j);
-                Ptr<NodeApplication> nApp = DynamicCast<NodeApplication>(n->GetApplication(0));
-                if(!nApp || !nApp->isNodeAlive()) continue;
-                if(nApp->getMyLeader() == leaderToFail && 
-                   nApp->GetNodeIpAddress() != leaderToFail){
-                    realOrphans++;
-                }
-            }
-            totalRealOrphans += realOrphans;
-
-            NS_LOG_INFO("FAILURE_WAVE: Líder " << leaderToFail 
-                        << " falhou na onda " << this->currentFailureWave
-                        << " no tempo " << now << " - " << realOrphans << " nós órfãos"
-                        << " (clusterList size=" << nodeApp->getClusterSize() << ")");
-            
-            // Parar a aplicação do nó
-            Simulator::ScheduleNow(&Application::SetStopTime, app, Simulator::Now());
-            nodeApp->StopApplication();
-
-            // Notificar motor intuitivo sobre a morte do líder
-            intuitiveEngine->registerLeaderDeath(leaderToFail);
-
-            // Atualizar mapa de clusters
-            auto it = clusterInfoMap.find(leaderToFail);
-            if(it != clusterInfoMap.end()){
-                it->second.leaderAlive = false;
-            }
-        }
-
-        NS_LOG_INFO("FAILURE_WAVE: Onda " << this->currentFailureWave 
-                    << " completa — " << leadersToFail << " líderes falharam"
-                    << ", " << totalRealOrphans << " órfãos reais");
-    }
-
-void NodeAPApplication::triggerLeaderFailures(){
-        if(this->aptLeaders->empty()){
-            NS_LOG_INFO("FAILURE: Nenhum líder apto para aplicar falha no tempo " << Simulator::Now().GetSeconds());
-            return;
-        }
-
-        // Filtrar líderes aptos que tenham membros reais (via myLeader)
-        std::vector<Ipv6Address> eligibleLeaders;
-        for(auto& leaderAddr : *this->aptLeaders){
-            Ptr<Node> leaderNode = findNodeByAddress(this->networkNodes, leaderAddr);
-            if(!leaderNode) continue;
-            Ptr<NodeApplication> leaderApp = DynamicCast<NodeApplication>(
-                leaderNode->GetApplication(0));
-            if(!leaderApp || !leaderApp->isNodeAlive()) continue;
-
-            // Contar membros reais: nós vivos cujo myLeader é este líder (excluindo o próprio)
-            int realMembers = 0;
-            for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
-                Ptr<Node> node = this->networkNodes.Get(j);
-                Ptr<NodeApplication> nApp = DynamicCast<NodeApplication>(
-                    node->GetApplication(0));
-                if(!nApp || !nApp->isNodeAlive()) continue;
-                if(nApp->getMyLeader() == leaderAddr && 
-                   nApp->GetNodeIpAddress() != leaderAddr){
-                    realMembers++;
-                }
-            }
-
-            if(realMembers > 0){
-                eligibleLeaders.push_back(leaderAddr);
-                NS_LOG_INFO("FAILURE_ELIGIBLE: Leader " << leaderAddr 
-                            << " with " << realMembers << " real members"
-                            << " (clusterList size=" << leaderApp->getClusterSize() << ")");
-            } else {
-                NS_LOG_INFO("FAILURE_SKIPPED: Leader " << leaderAddr 
-                            << " has 0 real members (too small)");
-            }
-        }
-
-        if(eligibleLeaders.empty()){
-            NS_LOG_INFO("FAILURE: Nenhum líder elegível (todos os clusters têm apenas 1 nó) no tempo " << Simulator::Now().GetSeconds());
-            return;
-        }
-
-        // Calcular quantos líderes irão falhar baseado nos ELEGÍVEIS
-        int totalEligibleLeaders = eligibleLeaders.size();
-        int leadersToFail = (int)std::ceil(totalEligibleLeaders * this->actualFailurePercentage / 100.0);
-        
-        // Se a porcentagem > 0 mas o cálculo deu 0, forçar pelo menos 1
-        if(leadersToFail == 0 && this->actualFailurePercentage > 0){
-            leadersToFail = 1;
-        }
-
-        NS_LOG_INFO("FAILURE: " << leadersToFail << " de " << totalEligibleLeaders << " líderes elegíveis irão falhar (" << this->actualFailurePercentage << "%)");
-        NS_LOG_INFO("FAILURE: (Total aptos: " << this->aptLeaders->size() << ", Elegíveis após filtro: " << totalEligibleLeaders << ")");
-
-        // Embaralhar lista de líderes ELEGÍVEIS para seleção aleatória
-        // Fisher-Yates usando RNG do NS-3 (determinístico via seed+run)
-        Ptr<UniformRandomVariable> shuffleRng = CreateObject<UniformRandomVariable>();
-        for(int i = eligibleLeaders.size() - 1; i > 0; i--){
-            shuffleRng->SetAttribute("Min", DoubleValue(0));
-            shuffleRng->SetAttribute("Max", DoubleValue(i + 0.999));
-            int j = (int)shuffleRng->GetValue();
-            if(j > i) j = i;
-            std::swap(eligibleLeaders[i], eligibleLeaders[j]);
-        }
-
-        // Aplicar falha nos líderes selecionados
-        for(int i = 0; i < leadersToFail; i++){
-            Ipv6Address leaderToFail = eligibleLeaders[i];
-
-            // Encontrar o nó correspondente e desligá-lo
-            for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
-                Ptr<Node> node = this->networkNodes.Get(j);
-                Ptr<Ipv6> ipv6 = node->GetObject<Ipv6>();
-                Ipv6Address nodeAddr = ipv6->GetAddress(1, 0).GetAddress();
-
-                if(nodeAddr == leaderToFail){
-                    // Parar a aplicação do nó (falha completa)
-                    Ptr<Application> app = node->GetApplication(0);
-                    if(app){
-                        Simulator::ScheduleNow(&Application::SetStopTime, app, Simulator::Now());
-                        Ptr<NodeApplication> nodeApp = DynamicCast<NodeApplication>(app);
-                        if(nodeApp){
-                            // Contar órfãos reais: nós vivos cujo myLeader é este líder
-                            int realOrphans = 0;
-                            for(uint32_t k = 0; k < this->networkNodes.GetN(); k++){
-                                Ptr<Node> n = this->networkNodes.Get(k);
-                                Ptr<NodeApplication> nApp = DynamicCast<NodeApplication>(
-                                    n->GetApplication(0));
-                                if(!nApp || !nApp->isNodeAlive()) continue;
-                                if(nApp->getMyLeader() == leaderToFail && 
-                                   nApp->GetNodeIpAddress() != leaderToFail){
-                                    realOrphans++;
-                                }
-                            }
-                            NS_LOG_INFO("FAILURE: Líder " << leaderToFail << " falhou no tempo " 
-                                        << Simulator::Now().GetSeconds() << " - " << realOrphans 
-                                        << " nós órfãos (clusterList size=" << nodeApp->getClusterSize() << ")");
-                            nodeApp->StopApplication();
-
-                            // Notificar motor intuitivo sobre a morte do líder
-                            intuitiveEngine->registerLeaderDeath(leaderToFail);
-
-                            // Atualizar mapa de clusters
-                            auto it = clusterInfoMap.find(leaderToFail);
-                            if(it != clusterInfoMap.end()){
-                                it->second.leaderAlive = false;
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    }
-// ============================================================
+    // ============================================================
     // Aprendizado Intuitivo — Ciclo de Decisão
     // ============================================================
 
@@ -662,6 +402,10 @@ void NodeAPApplication::triggerLeaderFailures(){
         if(now >= 895.0) {
             return;
         }
+
+        // Contador de líderes que caíram (saturação por flood) entre o último
+        // ciclo e este. Populado pelo polling abaixo, atribuído ao snap depois.
+        uint32_t downThisCycle = 0;
 
         // [0] Primeiro ciclo: registrar TODOS os nós no aprendizado distribuído
         // No Python: self.L = {v: G.nodes[v].get("energy", 0.5) for v in G.nodes}
@@ -718,28 +462,30 @@ void NodeAPApplication::triggerLeaderFailures(){
                 entry.second.initialMemberCount = realMembers;
             }
 
-            // // Verificar se líder está vivo
-            // Ptr<Node> leaderNode = findNodeByAddress(this->networkNodes, leaderAddr);
-            // if(leaderNode){
-            //     Ptr<NodeApplication> leaderApp = DynamicCast<NodeApplication>(
-            //         leaderNode->GetApplication(0));
-            //     if(leaderApp){
-            //         entry.second.leaderAlive = leaderApp->isNodeAlive();
-            //     }
-            // }
-
-            // Verificação baseada estritamente na rede (timeout de heartbeats)
-            double timeoutThreshold = 15.0; // 3 heartbeats perdidos = morto
-            if ((now - entry.second.lastHeartbeat) > timeoutThreshold) {
-                if (entry.second.leaderAlive) {
-                    NS_LOG_INFO("TIMEOUT: Líder " << entry.first << " declarado morto por falta de comunicação (Possível ataque!)");
-                    entry.second.leaderAlive = false;
-                    // Notificar o motor para que a Q-Table possa agir sobre os órfãos
-                    intuitiveEngine->registerLeaderDeath(entry.first); 
+            // Verificar se líder está vivo — detectar transição alive→dead
+            // (= líder caiu desde o ciclo anterior; provável saturação por flood)
+            Ptr<Node> leaderNode = findNodeByAddress(this->networkNodes, leaderAddr);
+            if(leaderNode){
+                Ptr<NodeApplication> leaderApp = DynamicCast<NodeApplication>(
+                    leaderNode->GetApplication(0));
+                if(leaderApp){
+                    bool wasAlive = entry.second.leaderAlive;
+                    bool nowAlive = leaderApp->isNodeAlive();
+                    if(wasAlive && !nowAlive){
+                        downThisCycle++;
+                        NS_LOG_INFO("LEADER_DETECTED_DOWN: " << leaderAddr
+                                    << " at t=" << now
+                                    << " (provável saturação por flood)");
+                    }
+                    entry.second.leaderAlive = nowAlive;
                 }
-            } else {
-                entry.second.leaderAlive = true;
             }
+        }
+
+        // Contar líderes vivos no ciclo atual (depois de atualizar leaderAlive)
+        uint32_t aliveCount = 0;
+        for(const auto& entry : clusterInfoMap){
+            if(entry.second.leaderAlive) aliveCount++;
         }
 
         // [2] Atualizar features do detector de anomalias para cada líder
@@ -796,6 +542,15 @@ void NodeAPApplication::triggerLeaderFailures(){
         IntuitiveSnapshot snap = intuitiveEngine->decisionCycle(
             now, clusters, anomalousNodes, totalNetworkNodes);
 
+        // Telemetria de saturação: líderes vivos agora + quantos caíram este ciclo
+        snap.leadersAlive = aliveCount;
+        snap.leadersDownThisCycle = downThisCycle;
+
+        // [4.5] Fase 2 — defesa contra UDP flooder (membro→líder)
+        // Roda antes do processamento de órfãos pra que a próxima rodada já veja o
+        // efeito da quarentena (e o líder talvez deixe de ser anômalo).
+        processAttackersIntuitively(snap);
+
         // [5] Processar órfãos com decisão individual por órfão
         processOrphansIntuitively(snap);
 
@@ -807,33 +562,26 @@ void NodeAPApplication::triggerLeaderFailures(){
                 Ptr<NodeApplication> nodeApp = DynamicCast<NodeApplication>(
                     node->GetApplication(0));
                 if(!nodeApp || !nodeApp->isNodeAlive()) continue;
-                if(nodeApp->getMyLeader() == entry.first && 
+                if(nodeApp->getMyLeader() == entry.first &&
                    nodeApp->GetNodeIpAddress() != entry.first){
                     realMembers++;
                 }
             }
             entry.second.memberCount = realMembers;
+            // Após recovery (REALLOCATE/RECLUSTER), atualizar baseline:
+            // initialMemberCount representa o melhor estado já observado.
+            // Isso permite que reliability volte a 1.0 após recuperação bem-sucedida.
+            if(realMembers > (int)entry.second.initialMemberCount){
+                entry.second.initialMemberCount = realMembers;
+            }
 
-            // Ptr<Node> leaderNode = findNodeByAddress(this->networkNodes, entry.first);
-            // if(leaderNode){
-            //     Ptr<NodeApplication> leaderApp = DynamicCast<NodeApplication>(
-            //         leaderNode->GetApplication(0));
-            //     if(leaderApp){
-            //         entry.second.leaderAlive = leaderApp->isNodeAlive();
-            //     }
-            // }
-
-            // Verificação baseada estritamente na rede (timeout de heartbeats)
-            double timeoutThreshold = 15.0; // 3 heartbeats perdidos = morto
-            if ((now - entry.second.lastHeartbeat) > timeoutThreshold) {
-                if (entry.second.leaderAlive) {
-                    NS_LOG_INFO("TIMEOUT: Líder " << entry.first << " declarado morto por falta de comunicação (Possível ataque!)");
-                    entry.second.leaderAlive = false;
-                    // Notificar o motor para que a Q-Table possa agir sobre os órfãos
-                    intuitiveEngine->registerLeaderDeath(entry.first); 
+            Ptr<Node> leaderNode = findNodeByAddress(this->networkNodes, entry.first);
+            if(leaderNode){
+                Ptr<NodeApplication> leaderApp = DynamicCast<NodeApplication>(
+                    leaderNode->GetApplication(0));
+                if(leaderApp){
+                    entry.second.leaderAlive = leaderApp->isNodeAlive();
                 }
-            } else {
-                entry.second.leaderAlive = true;
             }
         }
 
@@ -914,6 +662,14 @@ void NodeAPApplication::triggerLeaderFailures(){
                 node->GetApplication(0));
             if(!nodeApp || !nodeApp->isNodeAlive()) continue;
 
+            // Excluir atacantes detectados: nó em globallyQuarantined é resíduo
+            // de ameaça, não candidato a recuperação. Sem este filtro, um atacante
+            // cujo líder original caiu seria realocado/reclusterizado como membro
+            // saudável e, no pior caso (RECLUSTER + caps raras), poderia virar
+            // líder do novo cluster. A flag de quarentena permanece global até o
+            // TTL (QUARANTINE_TTL) expirar.
+            if(globallyQuarantined.count(nodeAddr) > 0) continue;
+
             Ipv6Address leader = nodeApp->getMyLeader();
             // Nó é órfão se seu líder está no set de mortos
             // (e não é o próprio líder morto, que já foi desligado)
@@ -931,6 +687,8 @@ void NodeAPApplication::triggerLeaderFailures(){
         // Fonte 2: pendingOrphans (de ciclos anteriores)
         for(const auto& orphanAddr : pendingOrphans){
             if(collectedAddrs.count(orphanAddr) > 0) continue;
+            // Mesmo filtro de atacante detectado da Fonte 1
+            if(globallyQuarantined.count(orphanAddr) > 0) continue;
             Ptr<Node> orphanNode = findNodeByAddress(this->networkNodes, orphanAddr);
             if(!orphanNode) continue;
             Ptr<NodeApplication> orphanApp = DynamicCast<NodeApplication>(
@@ -1025,7 +783,7 @@ void NodeAPApplication::triggerLeaderFailures(){
 
             // [4c] Determinar estado do órfão
             OrphanState orphanState = DualSystemResponse::determineOrphanState(
-                bestSimExisting, simOrphans);
+                bestSimExisting, simOrphans, REALLOCATION_THRESHOLD, CLUSTERING_THRESHOLD);
 
             // [4d] S1/S2 escolhe ação para este órfão
             auto result = dualSys.chooseActionForOrphan(
@@ -1253,103 +1011,6 @@ void NodeAPApplication::triggerLeaderFailures(){
                     << " | S1=" << snap.cycleS1Count << " S2=" << snap.cycleS2Count);
     }
 
-    // ============================================================
-    // Configuração e seleção de atacantes (pós-clustering)
-    // ============================================================
-
-    void NodeAPApplication::setAttackConfig(uint32_t nAttackers, double startTime,
-                                             double rate, uint32_t payloadSize, uint32_t mode){
-        this->attackNAttackers = nAttackers;
-        this->attackStartTime = startTime;
-        this->attackRate = rate;
-        this->attackPayloadSize = payloadSize;
-        this->attackMode = mode;
-    }
-
-    void NodeAPApplication::selectAndConfigureAttackers(){
-        // Executado em t=200 — após clustering, AP sabe quem é líder e quem é membro
-
-        // Construir listas de candidatos baseado no modo
-        std::vector<uint32_t> candidates;
-
-        for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
-            Ptr<Node> node = this->networkNodes.Get(j);
-            Ptr<NodeApplication> nodeApp = DynamicCast<NodeApplication>(
-                node->GetApplication(0));
-            if(!nodeApp || !nodeApp->isNodeAlive()) continue;
-
-            bool nodeIsLeader = (clusterInfoMap.find(nodeApp->GetNodeIpAddress()) != clusterInfoMap.end());
-
-            if(this->attackMode == 1 && !nodeIsLeader){
-                // Modo 1: atacante é membro (não-líder)
-                candidates.push_back(j);
-            } else if(this->attackMode == 2 && nodeIsLeader){
-                // Modo 2: atacante é líder
-                // Filtrar líderes com membros reais (não unitários)
-                int realMembers = 0;
-                Ipv6Address leaderAddr = nodeApp->GetNodeIpAddress();
-                for(uint32_t k = 0; k < this->networkNodes.GetN(); k++){
-                    Ptr<Node> n = this->networkNodes.Get(k);
-                    Ptr<NodeApplication> nApp = DynamicCast<NodeApplication>(
-                        n->GetApplication(0));
-                    if(!nApp || !nApp->isNodeAlive()) continue;
-                    if(nApp->getMyLeader() == leaderAddr &&
-                       nApp->GetNodeIpAddress() != leaderAddr){
-                        realMembers++;
-                    }
-                }
-                if(realMembers > 0){
-                    candidates.push_back(j);
-                }
-            }
-        }
-
-        if(candidates.empty()){
-            NS_LOG_INFO("ATTACK_SELECT: Nenhum candidato encontrado para attackMode="
-                        << this->attackMode);
-            return;
-        }
-
-        // Selecionar nAttackers aleatoriamente entre os candidatos
-        Ptr<UniformRandomVariable> atkRng = CreateObject<UniformRandomVariable>();
-        atkRng->SetAttribute("Min", DoubleValue(0));
-        atkRng->SetAttribute("Max", DoubleValue(candidates.size() - 0.001));
-
-        std::set<uint32_t> selectedIndices;
-        uint32_t maxAttempts = this->attackNAttackers * 10;
-        uint32_t attempts = 0;
-        while(selectedIndices.size() < this->attackNAttackers &&
-              selectedIndices.size() < candidates.size() &&
-              attempts < maxAttempts){
-            uint32_t pick = (uint32_t)atkRng->GetValue();
-            if(pick >= candidates.size()) pick = candidates.size() - 1;
-            selectedIndices.insert(candidates[pick]);
-            attempts++;
-        }
-
-        // Configurar nós selecionados como atacantes
-        std::string modeStr = (this->attackMode == 1) ? "MEMBER→LEADER" : "LEADER→AP";
-        for(auto idx : selectedIndices){
-            Ptr<NodeApplication> nodeApp = DynamicCast<NodeApplication>(
-                this->networkNodes.Get(idx)->GetApplication(0));
-            if(!nodeApp) continue;
-
-            nodeApp->setAttackParams(this->attackStartTime, this->attackRate,
-                                     this->attackPayloadSize);
-
-            NS_LOG_INFO("ATTACKER_SELECTED: Node " << idx
-                        << " (" << nodeApp->GetNodeIpAddress() << ")"
-                        << " mode=" << modeStr
-                        << " isLeader=" << (clusterInfoMap.find(nodeApp->GetNodeIpAddress()) != clusterInfoMap.end())
-                        << " flood at t=" << this->attackStartTime
-                        << " rate=" << this->attackRate << " pkts/s");
-        }
-
-        NS_LOG_INFO("ATTACK_CONFIG: " << selectedIndices.size() << " atacantes selecionados"
-                    << " modo=" << modeStr
-                    << " de " << candidates.size() << " candidatos");
-    }
-
     std::vector<ClusterInfo> NodeAPApplication::buildClusterInfoVector() const {
         std::vector<ClusterInfo> result;
         for(const auto& entry : clusterInfoMap){
@@ -1384,8 +1045,14 @@ void NodeAPApplication::triggerLeaderFailures(){
         ofstream logFile("IntuitiveStats.csv");
         logFile << "timestamp,qi,sr,tii,arf,meanRho,netLearning,pThreat,"
                 << "totalOrphans,actionsReallocate,actionsRecluster,actionsDoNothing,"
-                << "cycleS1,cycleS2,anomalies,qDoNothing,qReallocate,qRecluster" << std::endl;
-        
+                << "cycleS1,cycleS2,anomalies,qDoNothing,qReallocate,qRecluster,"
+                // Telemetria do ramo atacante
+                << "suspectsCount,actionsAttackerQuarantine,actionsAttackerDoNothing,"
+                << "qAtkDNHigh,qAtkQuarHigh,qAtkDNLow,qAtkQuarLow,atkEpsilon,"
+                << "smartTransferOk,smartTransferNoDonor,smartRedundancyOk,"
+                << "leadersAlive,leadersDownThisCycle"
+                << std::endl;
+
         for(const auto& snap : history){
             logFile << snap.timestamp << ","
                     << snap.qi << ","
@@ -1404,7 +1071,20 @@ void NodeAPApplication::triggerLeaderFailures(){
                     << snap.anomalies << ","
                     << snap.qDoNothing << ","
                     << snap.qReallocate << ","
-                    << snap.qRecluster
+                    << snap.qRecluster << ","
+                    << snap.suspectsCount << ","
+                    << snap.actionsAttackerQuarantine << ","
+                    << snap.actionsAttackerDoNothing << ","
+                    << snap.qAttackerDoNothingHigh << ","
+                    << snap.qAttackerQuarantineHigh << ","
+                    << snap.qAttackerDoNothingLow << ","
+                    << snap.qAttackerQuarantineLow << ","
+                    << snap.attackerEpsilon << ","
+                    << snap.smartTransferOk << ","
+                    << snap.smartTransferNoDonor << ","
+                    << snap.smartRedundancyOk << ","
+                    << snap.leadersAlive << ","
+                    << snap.leadersDownThisCycle
                     << std::endl;
         }
         logFile.close();
@@ -1424,8 +1104,381 @@ void NodeAPApplication::triggerLeaderFailures(){
         qFile << "Epsilon final: " << intuitiveEngine->getDualSystem().getEpsilon() << std::endl;
         qFile << "S1 count total: " << intuitiveEngine->getDualSystem().getS1Count() << std::endl;
         qFile << "S2 count total: " << intuitiveEngine->getDualSystem().getS2Count() << std::endl;
+
+        // ============================================================
+        // Q-VALORES FINAIS — Ramo Atacante (Fase 2 / detective)
+        // ============================================================
+        const auto& aSys = intuitiveEngine->getAttackerSystem();
+        qFile << std::endl << "=== Q-VALORES FINAIS DO RAMO ATACANTE (3x2) ===" << std::endl;
+        for(int s = 0; s < ATTACKER_STATE_COUNT; s++){
+            qFile << "Estado " << AttackerStateNames[s] << ":" << std::endl;
+            for(int a = 0; a < ATTACKER_ACTION_COUNT; a++){
+                qFile << "  " << AttackerActionNames[a] << ": "
+                      << aSys.getQ(static_cast<AttackerState>(s),
+                                   static_cast<AttackerAction>(a))
+                      << std::endl;
+            }
+        }
+        qFile << "Epsilon atacante final: " << aSys.getEpsilon() << std::endl;
+        qFile << "Quarantine count total: " << aSys.getQuarantineCount() << std::endl;
+        qFile << "DoNothing count total:  " << aSys.getDoNothingCount() << std::endl;
         qFile.close();
 
         NS_LOG_INFO("INTUITIVE: Logs escritos em IntuitiveStats.csv e IntuitiveQValues.txt");
+    }
+
+    // ============================================================
+    // Fase 2 — pipeline de defesa (membro→líder)
+    // ============================================================
+
+    void NodeAPApplication::sendQuarantineOrder(Ipv6Address leaderAddr, Ipv6Address target){
+        // Payload: representação textual do IPv6 alvo (Ipv6Address::Print()).
+        std::stringstream ts;
+        target.Print(ts);
+        std::string payload = ts.str();
+
+        // sendMessageHelper unicast — usa o mesmo padrão dos demais envios do AP.
+        Ptr<Packet> p = Create<Packet>((uint8_t*)payload.c_str(), payload.size() + 1);
+        MyTag tag;
+        tag.SetSimpleValue(MessageTypes::QuarantineOrder);
+        p->AddPacketTag(tag);
+        Inet6SocketAddress remote(leaderAddr, 2020);
+        m_socket->SendTo(p, 0, remote);
+
+        NS_LOG_INFO("AP_QUARANTINE: order sent to leader " << leaderAddr
+                    << " target=" << target);
+    }
+
+    // ============================================================
+    // NOTA METODOLÓGICA — "líder fantasma" (ghost-leader)
+    // ============================================================
+    // O protocolo de clusterização herdado de sectional/synapt elege líderes
+    // de forma DISTRIBUÍDA E LOCAL: cada nó decide quem é seu myLeader olhando
+    // só sua própria vizinhança similar (clusterList passa pelo Z-score >=
+    // SIMILARITY_THRESHOLD = 0.95). Não há ack/handshake — o "líder" eleito
+    // pode ter elegido alguém diferente de si mesmo na visão dele.
+    //
+    // Consequência: existem nós cujo myLeader aponta para um IP que NUNCA
+    // enviou LeaderRegister ao AP (porque do ponto de vista do "líder" eleito,
+    // ele mesmo é membro de outro cluster). Esses são líderes fantasma — o AP
+    // não os conhece em clusterInfoMap. Em N grande (rede esparsa em
+    // LR-WPAN), ~10-20% dos nós podem cair nesta situação.
+    //
+    // No detective, isso se manifesta como atacantes cujo target é um IP que
+    // o AP não monitora — leaderSourceCounts não recebe nada de lá, e o
+    // AnomalyDetector não tem dados pra flagar. O atacante "ataca o vazio".
+    //
+    // **Tratamento adotado** (alinhado com sectional/synapt, que enfrentam o
+    // mesmo fenômeno como "clusters idle"): NÃO filtrar. Reportar via 3
+    // métricas separadas no paper (selected / effective / detected), onde a
+    // diferença selected → effective expõe a propriedade do clustering, e a
+    // diferença effective → detected é a capacidade do framework. Detalhes
+    // documentados em memory/detective_v1_state.md.
+    // ============================================================
+    void NodeAPApplication::processAttackersIntuitively(IntuitiveSnapshot& snap){
+        // Sem nenhum líder reportando contadores: nada a fazer.
+        if (leaderSourceCounts.empty()) return;
+
+        // 0) TTL cleanup: expirar quarentenas antigas para permitir reavaliação.
+        //    Caso de uso: líder original que aplicou a blocklist morreu/foi
+        //    substituído; ou o suspeito mudou de cluster e a quarentena antiga
+        //    não tem mais sentido. Após QUARANTINE_TTL segundos sem nova
+        //    observação, o IP pode ser re-quarentenado se voltar como suspeito.
+        double now = Simulator::Now().GetSeconds();
+        for (auto it = globallyQuarantined.begin(); it != globallyQuarantined.end(); ) {
+            if (now - it->second > QUARANTINE_TTL) it = globallyQuarantined.erase(it);
+            else ++it;
+        }
+
+        // 1) Detectar suspeitos via Z-score intra-cluster.
+        auto suspects = anomalyDetector->detectFlooders(leaderSourceCounts);
+        snap.suspectsCount = (uint32_t)suspects.size();
+
+        // 2) Mapear cada suspeito → líder que mais reportou tráfego dele.
+        //    Esse "líder do suspeito" é o cluster onde o atacante incomoda mais.
+        //    Usado tanto na decisão (smart-quarantine) quanto no reward observacional
+        //    (cluster cleanup metric).
+        std::map<Ipv6Address, Ipv6Address> suspectToLeader;
+        for (const auto& s : suspects) {
+            Ipv6Address bestLeader;
+            uint32_t maxCount = 0;
+            for (const auto& lr : leaderSourceCounts) {
+                auto it = lr.second.find(s.first);
+                if (it != lr.second.end() && it->second > maxCount) {
+                    maxCount = it->second;
+                    bestLeader = lr.first;
+                }
+            }
+            suspectToLeader[s.first] = bestLeader;
+        }
+
+        // 3) Recompensa observacional (sem ground-truth do simulador).
+        //    Sinais usados:
+        //      QUARANTINE: o cluster do suspeito quarentenado ficou "limpo"?
+        //                  (zero outros suspeitos remanescentes no mesmo líder)
+        //                  → +10 (eliminou ameaça e nenhuma outra surgiu)
+        //                  → -2  (limpeza parcial — outros suspeitos persistem,
+        //                         o atacante real pode ser outro ou são múltiplos)
+        //      DO_NOTHING: o suspeito ainda destaca?
+        //                  → +1   (calmou sozinho — era ruído, omissão correta)
+        //                  → -2   (persistiu em SUSPECT_LOW — omissão duvidosa)
+        //                  → -5   (escalou pra SUSPECT_HIGH — omissão custosa)
+        //    Limitação reconhecida: QUARANTINE em nó inocente recebe +reward se
+        //    cluster já estava calmo (não-observável localmente). Aceita como
+        //    bias defensivo (security-first): em IIoT, falso positivo é menos
+        //    grave que falso negativo. Threat model documentado no paper.
+        auto& attackerSys = intuitiveEngine->getAttackerSystem();
+        for (auto& prev : lastAttackerDecisions) {
+            const Ipv6Address& suspect = prev.first;
+            AttackerState  pState     = prev.second.state;
+            AttackerAction pAction    = prev.second.action;
+            Ipv6Address    prevLeader = prev.second.leader;
+
+            bool suspectPersists = (suspects.count(suspect) > 0);
+            AttackerState nextState = suspectPersists
+                ? AttackerDualSystem::stateFromZScore(suspects[suspect])
+                : ATK_CLEAR;
+
+            double reward;
+            if (pAction == ATK_QUARANTINE) {
+                int othersInCluster = 0;
+                for (const auto& sl : suspectToLeader) {
+                    if (sl.first == suspect) continue;
+                    if (sl.second == prevLeader) othersInCluster++;
+                }
+                reward = (othersInCluster == 0) ? +10.0 : -2.0;
+            } else { // ATK_DO_NOTHING
+                if (!suspectPersists) {
+                    reward = +1.0;
+                } else {
+                    reward = (nextState == ATK_SUSPECT_HIGH) ? -5.0 : -2.0;
+                }
+            }
+
+            attackerSys.updateQ(pState, pAction, reward, nextState);
+
+            NS_LOG_INFO("ATK_REWARD: suspect=" << suspect
+                        << " state=" << AttackerStateNames[pState]
+                        << " action=" << AttackerActionNames[pAction]
+                        << " reward=" << reward
+                        << " persisted=" << suspectPersists
+                        << " nextState=" << AttackerStateNames[nextState]);
+        }
+        lastAttackerDecisions.clear();
+
+        // 4) Decidir por suspeito atual via DualSystem (atacante).
+        for (const auto& s : suspects) {
+            const Ipv6Address& suspect = s.first;
+            double z = s.second;
+            AttackerState state = AttackerDualSystem::stateFromZScore(z);
+
+            // Já está em quarentena? Pular pra evitar comando redundante.
+            if (globallyQuarantined.count(suspect) > 0) continue;
+
+            AttackerAction action = attackerSys.selectAction(state);
+            Ipv6Address bestLeader = suspectToLeader[suspect];
+
+            if (action == ATK_QUARANTINE) snap.actionsAttackerQuarantine++;
+            else                          snap.actionsAttackerDoNothing++;
+
+            NS_LOG_INFO("ATK_DECISION: suspect=" << suspect
+                        << " z=" << z
+                        << " state=" << AttackerStateNames[state]
+                        << " action=" << AttackerActionNames[action]);
+
+            if (action == ATK_QUARANTINE) {
+                uint32_t maxCount = 0;
+                {
+                    auto lit = leaderSourceCounts.find(bestLeader);
+                    if (lit != leaderSourceCounts.end()) {
+                        auto sit = lit->second.find(suspect);
+                        if (sit != lit->second.end()) maxCount = sit->second;
+                    }
+                }
+                if (maxCount > 0) {
+                    // Fase 2.5 — smart quarantine: checar redundância de capabilities
+                    // antes de remover o suspeito. Se o suspeito carrega cap única
+                    // do cluster, tenta importar doador de outro cluster.
+                    auto missing = capsLostIfRemoved(bestLeader, suspect);
+                    auto fullUnion    = getClusterCapabilityUnion(bestLeader, Ipv6Address::GetAny());
+                    auto withoutCaps  = getClusterCapabilityUnion(bestLeader, suspect);
+                    if (missing.empty()) {
+                        snap.smartRedundancyOk++;
+                        NS_LOG_INFO("SMART_QUARANTINE: suspect=" << suspect
+                                    << " leader=" << bestLeader
+                                    << " redundancy_ok no_transfer_needed"
+                                    << " | cluster_caps=" << serializeCapabilities(&fullUnion)
+                                    << " caps_after=" << serializeCapabilities(&withoutCaps));
+                    } else {
+                        auto donor = findCapabilityDonor(missing, bestLeader, suspect);
+                        if (donor.found) {
+                            bool ok = transferDonorToCluster(donor.donor, donor.donorLeader, bestLeader);
+                            if (ok) snap.smartTransferOk++;
+                            NS_LOG_INFO("SMART_QUARANTINE: suspect=" << suspect
+                                        << " leader=" << bestLeader
+                                        << " missing_caps=" << serializeCapabilities(&missing)
+                                        << " donor=" << donor.donor
+                                        << " donor_from=" << donor.donorLeader
+                                        << " covered=" << donor.coveredCount << "/" << missing.size()
+                                        << " sim=" << donor.similarityToRecv
+                                        << " transfer=" << (ok ? "OK" : "FAIL"));
+                        } else {
+                            snap.smartTransferNoDonor++;
+                            NS_LOG_INFO("SMART_QUARANTINE: suspect=" << suspect
+                                        << " leader=" << bestLeader
+                                        << " missing_caps=" << serializeCapabilities(&missing)
+                                        << " no_donor_found — quarantining anyway (capability gap will persist)");
+                        }
+                    }
+                    sendQuarantineOrder(bestLeader, suspect);
+                    globallyQuarantined[suspect] = Simulator::Now().GetSeconds();
+                }
+            }
+
+            PendingDecision pd{state, action, bestLeader};
+            lastAttackerDecisions[suspect] = pd;
+        }
+
+        // 4) Decaimento de ε do ramo atacante apenas quando houve suspeitos no ciclo.
+        attackerSys.decayEpsilonIfActive((int)suspects.size());
+
+        // 5) Janela consumida: limpar contadores acumulados para a próxima rodada.
+        leaderSourceCounts.clear();
+    }
+
+    // ============================================================
+    // Fase 2.5 — smart quarantine (capability-aware)
+    // ============================================================
+    // PROPRIEDADE OPERACIONAL: estes helpers só disparam o caminho de
+    // transferência (findCapabilityDonor → transferDonorToCluster) em cenários
+    // raros sob a configuração padrão. Motivo: SIMILARITY_THRESHOLD = 0.95 em
+    // NodeApplication.cc força clusters de capabilities virtualmente idênticas
+    // (sim = |∩|/sqrt(|A|*|B|) >= 0.95 só é alcançável com >95% de overlap),
+    // o que torna a remoção de qualquer membro preservar todas as caps do
+    // cluster por construção. capsLostIfRemoved retorna vazio em ~100% dos
+    // smoke tests, e a quarentena segue direto pra sendQuarantineOrder.
+    //
+    // Mantido como rede de segurança defensiva para:
+    //   (a) cenários onde SIMILARITY_THRESHOLD seja relaxado experimentalmente
+    //   (b) clustering esparso pós-falhas múltiplas (não aplicável em
+    //       detective-v1 que não tem failures, mas relevante pra extensões)
+    //   (c) capability files sintéticos pra testes específicos
+    //
+    // O caminho foi validado em runtime via teste forçado com threshold 0.80
+    // e capabilities específicas (ver detective_v1_state.md). Lógica espelha
+    // o REALLOCATE de órfãos do synapt (mesmo padrão de addClusterMember/
+    // setMyLeader/memberCount).
+    // ============================================================
+
+    std::vector<capabilities> NodeAPApplication::getClusterCapabilityUnion(
+            Ipv6Address leader, Ipv6Address excludeNode) const {
+        std::set<capabilities> unionSet;
+        for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
+            Ptr<NodeApplication> app = DynamicCast<NodeApplication>(
+                this->networkNodes.Get(j)->GetApplication(0));
+            if(!app || !app->isNodeAlive()) continue;
+            Ipv6Address addr = app->GetNodeIpAddress();
+            if(addr == excludeNode) continue;
+            if(app->getMyLeader() != leader) continue;
+            for(capabilities c : app->getNodeCapabilities()){
+                unionSet.insert(c);
+            }
+        }
+        return std::vector<capabilities>(unionSet.begin(), unionSet.end());
+    }
+
+    std::vector<capabilities> NodeAPApplication::capsLostIfRemoved(
+            Ipv6Address leader, Ipv6Address suspect) const {
+        auto withSuspect    = getClusterCapabilityUnion(leader, Ipv6Address::GetAny());
+        auto withoutSuspect = getClusterCapabilityUnion(leader, suspect);
+        std::set<capabilities> withoutSet(withoutSuspect.begin(), withoutSuspect.end());
+        std::vector<capabilities> lost;
+        for(capabilities c : withSuspect){
+            if(withoutSet.count(c) == 0) lost.push_back(c);
+        }
+        return lost;
+    }
+
+    NodeAPApplication::DonorChoice NodeAPApplication::findCapabilityDonor(
+            const std::vector<capabilities>& missingCaps,
+            Ipv6Address receiverLeader,
+            Ipv6Address suspectToExclude) const {
+        DonorChoice best{Ipv6Address::GetAny(), Ipv6Address::GetAny(), 0, 0.0, false};
+        if(missingCaps.empty()) return best;
+
+        // Pré-compute fingerprint do cluster receptor (caps atuais sem o suspeito)
+        // pra desempate por similaridade.
+        auto recvCapsVec = getClusterCapabilityUnion(receiverLeader, suspectToExclude);
+        std::set<capabilities> missingSet(missingCaps.begin(), missingCaps.end());
+
+        for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
+            Ptr<NodeApplication> app = DynamicCast<NodeApplication>(
+                this->networkNodes.Get(j)->GetApplication(0));
+            if(!app || !app->isNodeAlive()) continue;
+
+            Ipv6Address candAddr = app->GetNodeIpAddress();
+            Ipv6Address candLeader = app->getMyLeader();
+
+            // Filtros básicos:
+            if(candAddr == suspectToExclude) continue;     // não é o suspeito
+            if(candLeader == receiverLeader) continue;     // já está no cluster receptor
+            if(clusterInfoMap.count(candAddr) > 0) continue;  // é líder de algum cluster — não pode ser doado
+            if(globallyQuarantined.count(candAddr) > 0) continue;  // está quarentenado em outro lugar
+            if(candLeader == Ipv6Address::GetAny()) continue;  // órfão sem cluster
+
+            // Cobre alguma das missing caps?
+            auto candCaps = app->getNodeCapabilities();
+            int covered = 0;
+            for(capabilities c : candCaps){
+                if(missingSet.count(c) > 0) covered++;
+            }
+            if(covered == 0) continue;
+
+            // Doar este nó deixaria o cluster de origem sem alguma capability?
+            auto donorClusterLost = capsLostIfRemoved(candLeader, candAddr);
+            if(!donorClusterLost.empty()) continue;  // não é doador safe
+
+            // Score: cobre mais caps > similaridade maior.
+            double sim = capabilitiesSimilarity(&candCaps, &recvCapsVec);
+            bool better = false;
+            if(covered > best.coveredCount) better = true;
+            else if(covered == best.coveredCount && sim > best.similarityToRecv) better = true;
+
+            if(better){
+                best.donor              = candAddr;
+                best.donorLeader        = candLeader;
+                best.coveredCount       = covered;
+                best.similarityToRecv   = sim;
+                best.found              = true;
+            }
+        }
+        return best;
+    }
+
+    bool NodeAPApplication::transferDonorToCluster(Ipv6Address donor,
+                                                    Ipv6Address oldLeader,
+                                                    Ipv6Address newLeader){
+        Ptr<NodeApplication> donorApp = nullptr, oldLeaderApp = nullptr, newLeaderApp = nullptr;
+        for(uint32_t j = 0; j < this->networkNodes.GetN(); j++){
+            Ptr<NodeApplication> app = DynamicCast<NodeApplication>(
+                this->networkNodes.Get(j)->GetApplication(0));
+            if(!app) continue;
+            if(app->GetNodeIpAddress() == donor)     donorApp     = app;
+            if(app->GetNodeIpAddress() == oldLeader) oldLeaderApp = app;
+            if(app->GetNodeIpAddress() == newLeader) newLeaderApp = app;
+        }
+        if(!donorApp || !oldLeaderApp || !newLeaderApp) return false;
+
+        oldLeaderApp->removeClusterMember(donor);
+        newLeaderApp->addClusterMember(donor);
+        donorApp->setMyLeader(newLeader);
+
+        // Ajustar memberCount nos dois clusters
+        auto oit = clusterInfoMap.find(oldLeader);
+        if(oit != clusterInfoMap.end() && oit->second.memberCount > 0) oit->second.memberCount--;
+        auto nit = clusterInfoMap.find(newLeader);
+        if(nit != clusterInfoMap.end()) nit->second.memberCount++;
+
+        return true;
     }
 }

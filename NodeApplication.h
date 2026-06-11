@@ -9,6 +9,9 @@
 #include "constants.h"
 #include "FloodAttack.h"
 
+#include <map>
+#include <set>
+
 using namespace ns3;
 
 namespace nr2{
@@ -46,6 +49,20 @@ namespace nr2{
             bool                                                    isCompromised;
             double                                                  attackStartTime;
 
+            // Modelo de saturação: pacotes de flood acumulados recebidos enquanto
+            // este nó é líder. NS-3 não modela exaustão de recurso por default —
+            // este contador + threshold simulam o efeito de "líder sobrecarregado
+            // por DDoS cai". Reset implícito ao perder/recuperar liderança.
+            uint64_t                                                totalFloodReceived;
+
+            // Fase 2 — detecção e quarentena
+            // Contador de pacotes recebidos por origem desde o último heartbeat.
+            // Líder reporta ao AP no heartbeat; resetado a cada envio.
+            std::map<Ipv6Address, uint32_t>                         incomingPacketCount;
+            // Blocklist: origens cujos pacotes devem ser descartados na recepção.
+            // Populada via MessageTypes::QuarantineOrder vindo do AP.
+            std::set<Ipv6Address>                                   quarantinedSources;
+
         public:
             void setup(capabilitiesVector cap);
             void recvCallback(Ptr<Socket> socket);
@@ -76,6 +93,7 @@ namespace nr2{
             int getClusterSize();
             std::vector<Ipv6Address> getClusterMembers();
             void addClusterMember(Ipv6Address member);
+            void removeClusterMember(Ipv6Address member);
             bool isNodeAlive() const { return alive; }
             void sendHeartbeat();
             void clearClusterMembers();
@@ -89,5 +107,22 @@ namespace nr2{
             void setAttackParams(double startTime, double rate, uint32_t payloadSize);
             void startFlood();
             bool isNodeCompromised() const { return isCompromised; }
+            bool isNodeLeader() const { return isLeader; }
+
+            // Fase 2 — quarentena
+            // Marca uma origem como bloqueada localmente (chamado pelo handler do QuarantineOrder).
+            void quarantineSource(Ipv6Address src) { quarantinedSources.insert(src); }
+            bool isQuarantined(Ipv6Address src) const { return quarantinedSources.count(src) > 0; }
+
+            // ============================================================
+            // Modelo de saturação por flood (Fase 2 / detective)
+            // ============================================================
+            // Threshold (acumulado de FloodPacket recebidos enquanto é líder)
+            // a partir do qual o líder cai (alive=false). Configurável globalmente
+            // via setFloodSaturationThreshold. Default 500 pacotes corresponde a
+            // ~10s de attack sustentado de 1 atacante a 50pkts/s — dá ao framework
+            // 1-2 ciclos pra detectar antes do colapso.
+            static uint64_t FLOOD_SATURATION_THRESHOLD;
+            static void setFloodSaturationThreshold(uint64_t t) { FLOOD_SATURATION_THRESHOLD = t; }
     };
 }

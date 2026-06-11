@@ -12,6 +12,9 @@
 #include "sys/stat.h"
 #include <iostream>
 #include <fstream>
+#include <random>
+#include <algorithm>
+#include <cstdint>
 
 #include "NodeAPApplication.h"
 #include "NodeApplication.h"
@@ -38,51 +41,40 @@ int main (int argc, char *argv[]){
 
 	uint32_t nNodes = 3;
 	int run = 0;
-	
-	// Parâmetros de falha
-	double failurePercentage = 0.0;      // Porcentagem fixa (0 = sem falha)
-	double failurePercentageMin = 0.0;   // Porcentagem mínima (para modo aleatório)
-	double failurePercentageMax = 0.0;   // Porcentagem máxima (para modo aleatório)
-	double failureTimeMin = 310.0;       // Tempo mínimo para falha
-	double failureTimeMax = 310.0;       // Tempo máximo para falha (igual = fixo)
 
-	// Parâmetro do aprendizado intuitivo
-	double decisionInterval = 60.0;  // Intervalo entre ciclos de decisão (segundos)
-
-	// Cenário 4: Múltiplas falhas sequenciais
-	bool multipleFailures = false;          // Se true, ativa modo de múltiplas falhas
-	double multiFailurePercent = 30.0;      // Porcentagem de falha em cada onda
-	std::string failureTimesStr = "300,450,600"; // Tempos das ondas de falha (separados por vírgula)
+	// Aprendizado intuitivo — intervalo entre ciclos de decisão (segundos)
+	double decisionInterval = 5.0;
 
 	// Persistência do aprendizado intuitivo entre rodadas
 	std::string knowledgePath = "";  // Vazio = sem persistência
 
-	// Parâmetros de ataque UDP flood
+	// Parâmetros de ataque UDP flood (insider threat — cenário central do detective)
 	uint32_t nAttackers = 0;              // Número de nós comprometidos (0 = sem ataque)
 	double attackStartTime = 300.0;       // Tempo de início do flood (s)
 	double attackRate = 50.0;             // Pacotes por segundo do flood
 	uint32_t attackPayloadSize = 64;      // Tamanho do payload (bytes)
 	uint32_t attackMode = 1;              // 1=membro→líder, 2=líder→AP
+	uint32_t floodSaturationThreshold = 500;  // Pacotes acumulados pra líder cair (0=desabilita modelo de saturação)
 
 	CommandLine cmd;
 	cmd.AddValue ("nNodes", "Number of node devices", nNodes);
 	cmd.AddValue ("run", "Run number", run);
-	cmd.AddValue ("failurePercentage", "Percentage of apt leaders to fail (0-100)", failurePercentage);
-	cmd.AddValue ("failurePercentageMin", "Minimum percentage for random failure (0-100)", failurePercentageMin);
-	cmd.AddValue ("failurePercentageMax", "Maximum percentage for random failure (0-100)", failurePercentageMax);
-	cmd.AddValue ("failureTimeMin", "Minimum time for failure in seconds", failureTimeMin);
-	cmd.AddValue ("failureTimeMax", "Maximum time for failure in seconds", failureTimeMax);
 	cmd.AddValue ("decisionInterval", "Intuitive learning decision cycle interval in seconds", decisionInterval);
-	cmd.AddValue ("multipleFailures", "Enable multiple sequential failures (scenario 4)", multipleFailures);
-	cmd.AddValue ("multiFailurePercent", "Failure percentage for each wave", multiFailurePercent);
-	cmd.AddValue ("failureTimes", "Comma-separated failure times (e.g. 300,450,600)", failureTimesStr);
 	cmd.AddValue ("knowledgePath", "Path to intuitive knowledge file (load/save between runs)", knowledgePath);
-	cmd.AddValue ("nAttackers", "Number of compromised nodes (0 = no attack)", nAttackers);
+	cmd.AddValue ("nAttackers", "Number of compromised nodes for UDP flood (0 = no attack)", nAttackers);
 	cmd.AddValue ("attackStartTime", "Time to start UDP flood (seconds)", attackStartTime);
 	cmd.AddValue ("attackRate", "Flood packet rate (packets/second)", attackRate);
 	cmd.AddValue ("attackPayloadSize", "Flood packet payload size (bytes)", attackPayloadSize);
 	cmd.AddValue ("attackMode", "Attack mode: 1=member floods leader, 2=leader floods AP", attackMode);
+	cmd.AddValue ("floodSaturationThreshold", "Accumulated flood packets that cause leader to fall (0 = disabled)", floodSaturationThreshold);
 	cmd.Parse (argc,argv);
+
+	// Aplicar threshold de saturação globalmente. Valor 0 desabilita o modelo
+	// (líder nunca cai por flood — útil pra rodar baseline "framework only").
+	nr2::NodeApplication::setFloodSaturationThreshold(
+		floodSaturationThreshold == 0 ? UINT64_MAX : floodSaturationThreshold);
+	NS_LOG_INFO("SATURATION_CONFIG: threshold=" << floodSaturationThreshold
+	            << " (0=desabilitado, líder não cai por flood)");
 
 	// Configurar RNG para reprodutibilidade
 	RngSeedManager::SetSeed(1);
@@ -176,37 +168,57 @@ int main (int argc, char *argv[]){
 	apApplication->SetStartTime(Seconds(10.0));
 	apApplication->SetStopTime(Seconds(SIMTIME+10.0));
 
-	// Configurar parâmetros de falha
-	apApplication->setFailurePercentage(failurePercentage);
-	apApplication->setFailurePercentageRange(failurePercentageMin, failurePercentageMax);
-	apApplication->setFailureTimeRange(failureTimeMin, failureTimeMax);
-
 	// Configurar parâmetros do aprendizado intuitivo
 	apApplication->setTotalNodes(nNodes);
 	apApplication->setDecisionInterval(decisionInterval);
 	apApplication->setKnowledgePath(knowledgePath);
 
-	// Configurar ataque UDP flood (seleção adiada para pós-clustering pelo AP)
+	// Configurar ataque UDP flood — seleção de atacantes feita externamente ao AP
+	// (operador do experimento), agendada para t=200s após estabilização do
+	// clustering. Entropia vem do SO via std::random_device (independente do RNG
+	// NS-3 controlado por --run), mantendo a clusterização reprodutível enquanto
+	// permite variação da composição de atacantes entre execuções.
+	// Padrão herdado de generateCap e do antigo setRandomFailures do synapt.
 	if(nAttackers > 0){
-		apApplication->setAttackConfig(nAttackers, attackStartTime, attackRate,
-		                               attackPayloadSize, attackMode);
 		NS_LOG_INFO("ATTACK_CONFIG: " << nAttackers << " atacantes, modo=" << attackMode
 		            << " (1=membro→líder, 2=líder→AP), início=" << attackStartTime << "s"
 		            << " taxa=" << attackRate << " pkts/s");
-	}
 
-	// Cenário 4: Configurar múltiplas falhas sequenciais
-	if(multipleFailures){
-		// Parsear tempos de falha da string "300,450,600"
-		std::vector<double> parsedTimes;
-		std::stringstream timeSS(failureTimesStr);
-		std::string token;
-		while(std::getline(timeSS, token, ',')){
-			parsedTimes.push_back(std::stod(token));
-		}
-		apApplication->setMultipleFailures(parsedTimes, multiFailurePercent);
-		NS_LOG_INFO("CENARIO4: " << parsedTimes.size() << " ondas de falha configuradas, "
-		            << multiFailurePercent << "% cada");
+		Simulator::Schedule(Seconds(200.0), [=, &nodes]() {
+			std::vector<uint32_t> candidates;
+			for(uint32_t j = 0; j < nodes.GetN(); j++){
+				Ptr<nr2::NodeApplication> nodeApp = DynamicCast<nr2::NodeApplication>(
+					nodes.Get(j)->GetApplication(0));
+				if(!nodeApp || !nodeApp->isNodeAlive()) continue;
+				bool nodeIsLeader = nodeApp->isNodeLeader();
+				if(attackMode == 1 && !nodeIsLeader)      candidates.push_back(j);
+				else if(attackMode == 2 && nodeIsLeader)  candidates.push_back(j);
+			}
+			if(candidates.empty()){
+				NS_LOG_INFO("ATTACK_SELECT: nenhum candidato para attackMode=" << attackMode);
+				return;
+			}
+			std::random_device rd;
+			std::default_random_engine gen{rd()};
+			std::shuffle(candidates.begin(), candidates.end(), gen);
+			size_t toSelect = std::min((size_t)nAttackers, candidates.size());
+
+			std::string modeStr = (attackMode == 1) ? "MEMBER→LEADER" : "LEADER→AP";
+			for(size_t i = 0; i < toSelect; i++){
+				Ptr<nr2::NodeApplication> nodeApp = DynamicCast<nr2::NodeApplication>(
+					nodes.Get(candidates[i])->GetApplication(0));
+				nodeApp->setAttackParams(attackStartTime, attackRate, attackPayloadSize);
+				NS_LOG_INFO("ATTACKER_SELECTED: Node " << candidates[i]
+				            << " (" << nodeApp->GetNodeIpAddress() << ")"
+				            << " mode=" << modeStr
+				            << " isLeader=" << nodeApp->isNodeLeader()
+				            << " flood at t=" << attackStartTime
+				            << " rate=" << attackRate << " pkts/s");
+			}
+			NS_LOG_INFO("ATTACK_CONFIG: " << toSelect << " atacantes selecionados"
+			            << " modo=" << modeStr
+			            << " de " << candidates.size() << " candidatos");
+		});
 	}
 
 	auto nodeAddrs = new std::vector<Ipv6Address>;

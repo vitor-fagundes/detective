@@ -36,6 +36,9 @@ namespace nr2 {
                                              IntuitiveAction action, double reward) {
         auto key = std::make_pair(stateBucket, static_cast<int>(action));
         intuitive[key].push_back(reward);
+        if (intuitive[key].size() > MAX_INTUITIVE_HISTORY) {
+            intuitive[key].pop_front();
+        }
     }
 
     void KnowledgeNetworks::updateContextual(double timestamp, double qi, double sr,
@@ -84,24 +87,6 @@ namespace nr2 {
         return bestAction;
     }
 
-    std::vector<Ipv6Address> KnowledgeNetworks::recentEmergentNodes() const {
-        std::vector<Ipv6Address> result;
-        for (const auto& evt : emergent) {
-            result.push_back(evt.node);
-        }
-        return result;
-    }
-
-    std::string KnowledgeNetworks::discretizeState(double qi, double sr) {
-        // Discretiza (QI, SR) em 9 combinações: {low,mid,high} × {low,mid,high}
-        auto bucket = [](double v) -> std::string {
-            if (v < 0.35) return "low";
-            if (v < 0.65) return "mid";
-            return "high";
-        };
-        return "qi_" + bucket(qi) + "_sr_" + bucket(sr);
-    }
-
     // ============================================================
     // MÓDULO 2 — DistributedLearning
     // ============================================================
@@ -131,16 +116,25 @@ namespace nr2 {
             Ipv6Address leader = cluster.first;
             const auto& members = cluster.second;
 
-            // Líder é vizinho dos membros
-            for (const auto& member : members) {
-                neighbors[leader].push_back(member);
-                neighbors[member].push_back(leader);
-                // Membros são vizinhos entre si dentro do cluster
-                for (const auto& otherMember : members) {
-                    if (member != otherMember) {
-                        neighbors[member].push_back(otherMember);
-                    }
+            // Líder-membro (bidirecional) + membro-membro (cada par uma vez — O(M²/2))
+            for (size_t i = 0; i < members.size(); i++) {
+                neighbors[leader].push_back(members[i]);
+                neighbors[members[i]].push_back(leader);
+                for (size_t j = i + 1; j < members.size(); j++) {
+                    neighbors[members[i]].push_back(members[j]);
+                    neighbors[members[j]].push_back(members[i]);
                 }
+            }
+        }
+
+        // Atualizar clusterLeader para cada nó (necessário para antScore do TII)
+        for (const auto& cluster : clusterMembers) {
+            Ipv6Address leader = cluster.first;
+            auto lit = nodes.find(leader);
+            if (lit != nodes.end()) lit->second.clusterLeader = leader;
+            for (const auto& member : cluster.second) {
+                auto mit = nodes.find(member);
+                if (mit != nodes.end()) mit->second.clusterLeader = leader;
             }
         }
 
@@ -175,7 +169,7 @@ namespace nr2 {
             // Estímulo ambiental: penalidade se anômalo, bônus se vizinhos saudáveis
             double envStimulus = 0.0;
             if (anomalousNodes.count(addr) > 0) {
-                envStimulus = -0.05;
+                envStimulus = m_xiAnomalous;
             } else if (totalNeighCount > 0) {
                 envStimulus = 0.01 * (double)aliveNeighCount / (double)totalNeighCount;
             }
@@ -197,13 +191,9 @@ namespace nr2 {
     double DistributedLearning::threatProbability(
             const std::vector<Ipv6Address>& aliveLeaders,
             uint32_t totalLeaders) const {
-        // pThreat = 1 - (mean_Li_vivos × fração_sobreviventes)
-        // Antes: pThreat = 1 - mean_Li_vivos, que DESCIA quando líderes morriam
-        // (porque os remanescentes tinham Li acima da média).
-        // Agora: matar 4 de 11 líderes → survivalRatio=0.636 → pThreat sobe.
-        if (totalLeaders == 0) {
-            return 1.0;
-        }
+        // pThreat = 1 - mean_Li(líderes vivos)
+        // Alinhado com Python: líderes com Li baixo sinalizam rede frágil.
+        (void)totalLeaders;
 
         std::vector<double> leaderLi;
         for (const auto& leader : aliveLeaders) {
@@ -223,9 +213,7 @@ namespace nr2 {
         }
         mean /= leaderLi.size();
 
-        double survivalRatio = (double)leaderLi.size() / (double)totalLeaders;
-
-        return std::min(1.0, std::max(0.0, 1.0 - mean * survivalRatio));
+        return std::min(1.0, std::max(0.0, 1.0 - mean));
     }
 
     double DistributedLearning::networkLearningMean() const {
@@ -258,10 +246,11 @@ namespace nr2 {
         }
     }
 
-    void DistributedLearning::markAnomalous(Ipv6Address addr, bool anomalous) {
+    void DistributedLearning::promoteToLeader(Ipv6Address addr) {
         auto it = nodes.find(addr);
         if (it != nodes.end()) {
-            it->second.isAnomalous = anomalous;
+            it->second.isLeader = true;
+            it->second.clusterLeader = addr;
         }
     }
 
@@ -273,22 +262,26 @@ namespace nr2 {
                                            double epsilonMin)
         : epsilon(epsilon), epsilonDecay(epsilonDecay), epsilonMin(epsilonMin),
           s1Count(0), s2Count(0) {
-        // Inicializar Q-table 4×3 com zeros
+        // Inicializar Q-table 3×3 com zeros
         for (int s = 0; s < ORPHAN_STATE_COUNT; s++) {
             for (int a = 0; a < INTUITIVE_ACTION_COUNT; a++) {
                 Q[s][a] = 0.0;
             }
         }
+        // RNGs criados uma vez — evitar alocação NS-3 por chamada S2
+        m_uniformRng = CreateObject<UniformRandomVariable>();
+        m_uniformRng->SetAttribute("Min", DoubleValue(0.0));
+        m_uniformRng->SetAttribute("Max", DoubleValue(1.0));
+        m_actionRng = CreateObject<UniformRandomVariable>();
+        m_actionRng->SetAttribute("Min", DoubleValue(0.0));
+        m_actionRng->SetAttribute("Max", DoubleValue(INTUITIVE_ACTION_COUNT - 0.001));
     }
 
-    OrphanState DualSystemResponse::determineOrphanState(double simExisting, double simOrphans) {
-        bool existingHigh = (simExisting >= SIMILARITY_HIGH_THRESHOLD);
-        bool orphansHigh  = (simOrphans >= SIMILARITY_HIGH_THRESHOLD);
-
-        if (existingHigh && orphansHigh)  return SIM_BOTH_HIGH;
-        if (existingHigh && !orphansHigh) return SIM_EXISTING_HIGH;
-        if (!existingHigh && orphansHigh) return SIM_ORPHAN_HIGH;
-        return SIM_BOTH_MEDIUM;
+    OrphanState DualSystemResponse::determineOrphanState(double simExisting, double simOrphans,
+                                                           double existingThreshold, double orphansThreshold) {
+        if (simExisting >= existingThreshold) return EXISTING_VIABLE;
+        if (simOrphans  >= orphansThreshold)  return ORPHAN_ONLY;
+        return NO_MATCH;
     }
 
     IntuitiveAction DualSystemResponse::system1Response(
@@ -308,13 +301,11 @@ namespace nr2 {
 
         // Fallback: heurística estática (bootstrap — sem experiência acumulada)
         switch (orphanState) {
-            case SIM_EXISTING_HIGH:
+            case EXISTING_VIABLE:
                 return REALLOCATE_TO_EXISTING;
-            case SIM_ORPHAN_HIGH:
+            case ORPHAN_ONLY:
                 return RECLUSTER_ORPHANS;
-            case SIM_BOTH_HIGH:
-                return REALLOCATE_TO_EXISTING;
-            case SIM_BOTH_MEDIUM:
+            case NO_MATCH:
             default:
                 return DO_NOTHING;
         }
@@ -326,15 +317,9 @@ namespace nr2 {
         s2Count++;
         int s = static_cast<int>(orphanState);
 
-        // ε-greedy: exploração aleatória (NS-3 RNG para reprodutibilidade)
-        Ptr<UniformRandomVariable> uRng = CreateObject<UniformRandomVariable>();
-        uRng->SetAttribute("Min", DoubleValue(0.0));
-        uRng->SetAttribute("Max", DoubleValue(1.0));
-        if (uRng->GetValue() < epsilon) {
-            Ptr<UniformRandomVariable> aRng = CreateObject<UniformRandomVariable>();
-            aRng->SetAttribute("Min", DoubleValue(0.0));
-            aRng->SetAttribute("Max", DoubleValue(INTUITIVE_ACTION_COUNT - 0.001));
-            return static_cast<IntuitiveAction>((int)aRng->GetValue());
+        // ε-greedy: exploração aleatória
+        if (m_uniformRng->GetValue() < epsilon) {
+            return static_cast<IntuitiveAction>((int)m_actionRng->GetValue());
         }
 
         // Explotação: melhor ação ajustada pela capacidade de aprendizado
@@ -346,8 +331,7 @@ namespace nr2 {
         }
 
         // Penalizar DO_NOTHING para estados onde há opção viável
-        if (orphanState == SIM_EXISTING_HIGH || orphanState == SIM_ORPHAN_HIGH
-            || orphanState == SIM_BOTH_HIGH) {
+        if (orphanState == EXISTING_VIABLE || orphanState == ORPHAN_ONLY) {
             adjustedQ[DO_NOTHING] -= 0.5;
         }
 
@@ -370,7 +354,7 @@ namespace nr2 {
             double qi, double sr, double pThreat,
             OrphanState orphanState) {
 
-        if (pThreat > THRESHOLD_S1) {
+        if (pThreat > thresholdS1) {
             // Ameaça alta → System 1 (resposta imediata baseada em experiência)
             IntuitiveAction action = system1Response(knowledge, orphanState);
             return std::make_pair(action, SYSTEM_S1);
@@ -401,13 +385,6 @@ namespace nr2 {
         // Q-learning update
         double oldQ = Q[s][a];
         Q[s][a] = (1.0 - ALPHA_Q) * oldQ + ALPHA_Q * (reward + GAMMA_Q * maxQ);
-    }
-
-    void DualSystemResponse::updateQGlobal(double qiBefore, double qiAfter,
-                                            double srBefore, double srAfter) {
-        // Atualização global pós-ciclo — não modifica Q-Table (já atualizada por órfão)
-        // Reservado para uso futuro ou métricas adicionais
-        (void)qiBefore; (void)qiAfter; (void)srBefore; (void)srAfter;
     }
 
     void DualSystemResponse::decayEpsilon() {
@@ -484,17 +461,36 @@ namespace nr2 {
 
     double computeTII(
             const DistributedLearning& distLearn,
-            const std::vector<Ipv6Address>& leaders,
+            const std::vector<ClusterInfo>& clusters,
             uint32_t totalAliveNodes) {
-        // TII(T) = Σ wi · anticipation_score(i) / |V|
-        // Simplificado: wi = Li, anticipation_score = 1 se líder vivo, 0 se não
+        // TII(T) = Σ wi · anticipation_score(i) / |V|   [Def. 2]
+        // wi = Li do nó
+        // anticipation_score: 1.0 se líder ativo (conectado ao AP)
+        //                     0.5 se membro em cluster ativo (um salto do AP)
+        //                     0.0 se órfão (sem caminho ao serviço)
         if (totalAliveNodes == 0) return 0.0;
 
+        std::set<Ipv6Address> aliveLeaderSet;
+        for (const auto& c : clusters) {
+            if (c.leaderAlive) aliveLeaderSet.insert(c.leaderAddr);
+        }
+
         double sum = 0.0;
-        for (const auto& leader : leaders) {
-            double wi = distLearn.getLi(leader);
-            // Líderes com Li alto → alta capacidade de antecipação
-            sum += wi;
+        for (const auto& entry : distLearn.getAllNodes()) {
+            if (!entry.second.alive) continue;
+
+            double wi = entry.second.Li;
+            double antScore;
+
+            if (entry.second.isLeader && aliveLeaderSet.count(entry.first) > 0) {
+                antScore = 1.0;
+            } else if (aliveLeaderSet.count(entry.second.clusterLeader) > 0) {
+                antScore = 0.5;
+            } else {
+                antScore = 0.0;
+            }
+
+            sum += wi * antScore;
         }
 
         return sum / totalAliveNodes;
@@ -508,19 +504,106 @@ namespace nr2 {
     }
 
     double computeStructuralFlexibility(
-            const std::vector<ClusterInfo>& clusters,
+            const DistributedLearning& distLearn,
             uint32_t totalAliveNodes) {
-        // Proporção de clusters com líder ativo e que aceitaram tarefas
-        if (clusters.empty()) return 0.0;
+        // Fração de nós vivos com grau > 1 na topologia de cluster.
+        // Líderes ativos conectam AP + membros → grau > 1.
+        // Membros conectam apenas ao líder → grau = 1.
+        if (totalAliveNodes == 0) return 0.0;
 
-        int healthyClusters = 0;
-        for (const auto& cluster : clusters) {
-            if (cluster.leaderAlive && cluster.hasAcceptedTask) {
-                healthyClusters++;
+        int redundant = 0;
+        for (const auto& entry : distLearn.getAllNodes()) {
+            if (entry.second.alive && entry.second.isLeader) {
+                redundant++;
             }
         }
 
-        return (double)healthyClusters / clusters.size();
+        return (double)redundant / totalAliveNodes;
+    }
+
+    // ============================================================
+    // AttackerDualSystem — Pipeline de defesa UDP DoS (Fase 2)
+    // ============================================================
+
+    AttackerDualSystem::AttackerDualSystem(double eps, double decay, double minEps)
+        : epsilon(eps), epsilonDecay(decay), epsilonMin(minEps),
+          quarantineCount(0), doNothingCount(0) {
+        for(int s = 0; s < ATTACKER_STATE_COUNT; s++){
+            for(int a = 0; a < ATTACKER_ACTION_COUNT; a++){
+                qTable[s][a] = 0.0;
+            }
+        }
+        m_uniformRng = CreateObject<UniformRandomVariable>();
+        m_uniformRng->SetAttribute("Min", DoubleValue(0.0));
+        m_uniformRng->SetAttribute("Max", DoubleValue(1.0));
+        m_actionRng = CreateObject<UniformRandomVariable>();
+        m_actionRng->SetAttribute("Min", DoubleValue(0.0));
+        m_actionRng->SetAttribute("Max", DoubleValue(ATTACKER_ACTION_COUNT - 0.001));
+    }
+
+    AttackerState AttackerDualSystem::stateFromZScore(double z) {
+        if (z < ATTACKER_Z_LOW)  return ATK_CLEAR;
+        if (z < ATTACKER_Z_HIGH) return ATK_SUSPECT_LOW;
+        return ATK_SUSPECT_HIGH;
+    }
+
+    AttackerAction AttackerDualSystem::selectAction(AttackerState state) {
+        // ε-greedy
+        if (m_uniformRng->GetValue() < epsilon) {
+            AttackerAction a = static_cast<AttackerAction>((int)m_actionRng->GetValue());
+            if (a == ATK_QUARANTINE) quarantineCount++; else doNothingCount++;
+            return a;
+        }
+        // Exploit: argmax(Q)
+        AttackerAction best = ATK_DO_NOTHING;
+        double bestQ = qTable[state][ATK_DO_NOTHING];
+        for (int a = 1; a < ATTACKER_ACTION_COUNT; a++) {
+            if (qTable[state][a] > bestQ) {
+                bestQ = qTable[state][a];
+                best = static_cast<AttackerAction>(a);
+            }
+        }
+        if (best == ATK_QUARANTINE) quarantineCount++; else doNothingCount++;
+        return best;
+    }
+
+    void AttackerDualSystem::updateQ(AttackerState state, AttackerAction action,
+                                      double reward, AttackerState nextState) {
+        // Reaproveita ALPHA_Q e GAMMA_Q do motor de órfãos.
+        double maxNext = qTable[nextState][0];
+        for (int a = 1; a < ATTACKER_ACTION_COUNT; a++) {
+            if (qTable[nextState][a] > maxNext) maxNext = qTable[nextState][a];
+        }
+        double target = reward + GAMMA_Q * maxNext;
+        qTable[state][action] += ALPHA_Q * (target - qTable[state][action]);
+    }
+
+    void AttackerDualSystem::decayEpsilonIfActive(int suspectsThisCycle) {
+        if (suspectsThisCycle > 0 && epsilon > epsilonMin) {
+            epsilon = std::max(epsilonMin, epsilon * epsilonDecay);
+        }
+    }
+
+    void AttackerDualSystem::saveToStream(std::ofstream& out) const {
+        out << "[QTABLE_ATTACKER]" << std::endl;
+        out << "# state,action,q_value" << std::endl;
+        for (int s = 0; s < ATTACKER_STATE_COUNT; s++) {
+            for (int a = 0; a < ATTACKER_ACTION_COUNT; a++) {
+                out << s << "," << a << "," << qTable[s][a] << std::endl;
+            }
+        }
+        out << "[EPSILON_ATTACKER]" << std::endl;
+        out << "# epsilon" << std::endl;
+        out << epsilon << std::endl;
+        out << "[COUNTERS_ATTACKER]" << std::endl;
+        out << "# quarantine_count,do_nothing_count" << std::endl;
+        out << quarantineCount << "," << doNothingCount << std::endl;
+    }
+
+    bool AttackerDualSystem::loadFromStream(std::ifstream& /*in*/) {
+        // O parser de saveKnowledge() do engine consome as 3 seções no loop principal.
+        // Mantido por simetria de API.
+        return true;
     }
 
     // ============================================================
@@ -540,64 +623,45 @@ namespace nr2 {
     }
 
     double IntuitiveLearningEngine::calculateQI(
-            const std::vector<ClusterInfo>& clusters, uint32_t totalNodes) {
-        // QI = combinação ponderada de:
-        //   - Fração de clusters com líder ativo (connectivity)
-        //   - Proporção de nós cobertos (propagation)
-        //   - Saúde média dos clusters ponderada por qualidade do enlace (delivery)
-        //
-        // No Python: delivery usa edge_quality × capacity.
-        // No NS-3: usamos (memberCount/initialMemberCount) × linkQuality
-        //   onde linkQuality = proxy baseado na recência do heartbeat.
-        //   Isso faz com que ações que melhoram heartbeat (REINFORCE, REPAIR)
-        //   impactem diretamente o QI.
-        if (clusters.empty() || totalNodes == 0) return 0.0;
+            const std::vector<ClusterInfo>& clusters, uint32_t liveDenom) {
+        if (clusters.empty() || liveDenom == 0) return 0.0;
 
         double now = Simulator::Now().GetSeconds();
 
-        // Connectivity: fração de clusters com líder ativo
         int activeClusters = 0;
         for (const auto& c : clusters) {
             if (c.leaderAlive) activeClusters++;
         }
         double connectivity = (double)activeClusters / clusters.size();
 
-        // Propagation: nós cobertos por clusters ativos / total de nós
         uint32_t coveredNodes = 0;
         for (const auto& c : clusters) {
             if (c.leaderAlive) {
-                coveredNodes += c.memberCount + 1; // +1 para o líder
+                coveredNodes += c.memberCount + 1;
             }
         }
-        double propagation = std::min(1.0, (double)coveredNodes / totalNodes);
+        double propagation = std::min(1.0, (double)coveredNodes / liveDenom);
 
-        // Delivery: saúde média dos clusters × qualidade do enlace
-        // Alinhado com Python: delivery_ratio_proxy usa quality × capacity
         double deliverySum = 0.0;
         int deliveryCount = 0;
         for (const auto& c : clusters) {
             if (c.leaderAlive && c.initialMemberCount > 0) {
                 double healthRatio = std::min(1.0, (double)c.memberCount / c.initialMemberCount);
-                
-                // linkQuality: proxy de edge quality via recência do heartbeat
                 double elapsed = (c.lastHeartbeat > 0) ?
                     (now - c.lastHeartbeat) : 120.0;
                 double linkQuality = std::max(0.1, 1.0 - std::min(1.0, elapsed / 120.0));
-                
                 deliverySum += healthRatio * linkQuality;
                 deliveryCount++;
             }
         }
         double delivery = deliveryCount > 0 ? deliverySum / deliveryCount : 0.0;
 
-        // QI = 0.5·connectivity + 0.3·propagation + 0.2·delivery
         return std::min(1.0, 0.5 * connectivity + 0.3 * propagation + 0.2 * delivery);
     }
 
     double IntuitiveLearningEngine::calculateSR(
-            const std::vector<ClusterInfo>& clusters, uint32_t totalNodes) {
-        // SR = fração de nós que alcançam o AP (via clusters com líder ativo)
-        if (totalNodes == 0) return 0.0;
+            const std::vector<ClusterInfo>& clusters, uint32_t liveDenom) {
+        if (liveDenom == 0) return 0.0;
 
         uint32_t reachableNodes = 0;
         for (const auto& c : clusters) {
@@ -606,7 +670,7 @@ namespace nr2 {
             }
         }
 
-        return std::min(1.0, (double)reachableNodes / totalNodes);
+        return std::min(1.0, (double)reachableNodes / liveDenom);
     }
 
     IntuitiveSnapshot IntuitiveLearningEngine::decisionCycle(
@@ -615,9 +679,15 @@ namespace nr2 {
             const std::set<Ipv6Address>& anomalousNodes,
             uint32_t totalNodes) {
 
-        // [1] Calcular métricas globais
-        double qi = calculateQI(clusters, totalNodes);
-        double sr = calculateSR(clusters, totalNodes);
+        // [1] Calcular métricas globais (aliveCount computado uma vez — reutilizado em [5])
+        uint32_t aliveCount = 0;
+        for (const auto& e : distLearn.getAllNodes()) {
+            if (e.second.alive) aliveCount++;
+        }
+        uint32_t liveDenom = aliveCount > 0 ? aliveCount : totalNodes;
+
+        double qi = calculateQI(clusters, liveDenom);
+        double sr = calculateSR(clusters, liveDenom);
 
         // [2] Calcular probabilidade de ameaça via aprendizado distribuído
         std::vector<Ipv6Address> aliveLeaders;
@@ -651,28 +721,19 @@ namespace nr2 {
         knowledge.updateContextual(currentTime, qi, sr, threatLevel,
                                     activeLeaders, orphans, totalNodes);
 
-        // [4] Atualizar aprendizado distribuído
-        std::map<Ipv6Address, std::vector<Ipv6Address>> clusterMembers;
-        for (const auto& c : clusters) {
-            if (c.leaderAlive) {
-                clusterMembers[c.leaderAddr] = {};
-            }
-        }
-        distLearn.step(clusterMembers, anomalousNodes);
-
-        // [5] Salvar estado para uso no loop por órfão (no AP)
+        // [4] Salvar estado para uso no loop por órfão (no AP)
         lastQI = qi;
         lastSR = sr;
         lastPThreat = pThreat;
 
-        // [6] Métricas de intuição
+        // [5] Métricas de intuição — liveDenom calculado em [1]
         double meanRho = computeResilienceActivation(clusters, distLearn);
-        double tii = computeTII(distLearn, aliveLeaders, totalNodes);
-        double flex = computeStructuralFlexibility(clusters, totalNodes);
-        // responseTime será preenchido pelo AP com base nos contadores S1/S2
+        double tii = computeTII(distLearn, clusters, liveDenom);
+        double flex = computeStructuralFlexibility(distLearn, liveDenom);
+        // ARF com response_time placeholder — será recalculado pelo AP após saber S1/S2
         double arf = computeARF(flex, ALPHA_LEARN, distLearn.networkLearningMean(), 2.0);
 
-        // [7] Construir snapshot parcial (contadores de ação preenchidos pelo AP)
+        // [6] Construir snapshot parcial (contadores de ação preenchidos pelo AP)
         IntuitiveSnapshot snap;
         snap.timestamp = currentTime;
         snap.qi = qi;
@@ -692,6 +753,22 @@ namespace nr2 {
         snap.qDoNothing = dualSys.getQValueAvg(DO_NOTHING);
         snap.qReallocate = dualSys.getQValueAvg(REALLOCATE_TO_EXISTING);
         snap.qRecluster = dualSys.getQValueAvg(RECLUSTER_ORPHANS);
+
+        // Telemetria do ramo atacante — contadores zerados, AP preenche depois.
+        // Q-values capturados aqui pra refletir estado pré-decisão deste ciclo.
+        snap.suspectsCount = 0;
+        snap.actionsAttackerQuarantine = 0;
+        snap.actionsAttackerDoNothing  = 0;
+        snap.smartTransferOk      = 0;
+        snap.smartTransferNoDonor = 0;
+        snap.smartRedundancyOk    = 0;
+        snap.leadersAlive         = 0;  // AP preenche depois
+        snap.leadersDownThisCycle = 0;  // AP preenche depois
+        snap.qAttackerDoNothingHigh  = attackerSys.getQ(ATK_SUSPECT_HIGH, ATK_DO_NOTHING);
+        snap.qAttackerQuarantineHigh = attackerSys.getQ(ATK_SUSPECT_HIGH, ATK_QUARANTINE);
+        snap.qAttackerDoNothingLow   = attackerSys.getQ(ATK_SUSPECT_LOW,  ATK_DO_NOTHING);
+        snap.qAttackerQuarantineLow  = attackerSys.getQ(ATK_SUSPECT_LOW,  ATK_QUARANTINE);
+        snap.attackerEpsilon         = attackerSys.getEpsilon();
 
         // NÃO push_back ainda — o AP preencherá os contadores e fará push
 
@@ -714,7 +791,7 @@ namespace nr2 {
 
         // Atualizar Rhistorical com métricas globais pós-ação
         // Usar DO_NOTHING como placeholder — a ação real é por órfão
-        knowledge.updateHistorical(lastQI, DO_NOTHING, qiAfter - lastQI, srAfter - lastSR);
+        knowledge.updateHistorical(Simulator::Now().GetSeconds(), DO_NOTHING, qiAfter - lastQI, srAfter - lastSR);
     }
 
     // ============================================================
@@ -722,8 +799,8 @@ namespace nr2 {
     // ============================================================
 
     void KnowledgeNetworks::saveToStream(std::ofstream& out) const {
-        // Rhistorical: timestamp,action,qiDelta,srDelta,reward
         out << "[HISTORICAL]" << std::endl;
+        out << "# timestamp,action,qiDelta,srDelta,reward" << std::endl;
         for (const auto& entry : historical) {
             out << entry.first << ","
                 << entry.second.action << ","
@@ -732,8 +809,8 @@ namespace nr2 {
                 << entry.second.reward << std::endl;
         }
 
-        // Rintuitive: stateBucket,action,reward1;reward2;...
         out << "[INTUITIVE]" << std::endl;
+        out << "# stateBucket,action,reward_window..." << std::endl;
         for (const auto& entry : intuitive) {
             out << entry.first.first << "," << entry.first.second;
             for (double r : entry.second) {
@@ -743,57 +820,13 @@ namespace nr2 {
         }
     }
 
-    void KnowledgeNetworks::loadFromStream(std::ifstream& in) {
-        std::string line;
-        std::string section;
-
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            if (line[0] == '[') {
-                section = line;
-                if (section != "[HISTORICAL]" && section != "[INTUITIVE]") {
-                    break; // Próxima seção de outro módulo
-                }
-                continue;
-            }
-
-            if (section == "[HISTORICAL]") {
-                // timestamp,action,qiDelta,srDelta,reward
-                std::stringstream ss(line);
-                std::string tok;
-                HistoricalRecord rec;
-
-                std::getline(ss, tok, ','); double ts = std::stod(tok);
-                std::getline(ss, tok, ','); rec.action = static_cast<IntuitiveAction>(std::stoi(tok));
-                std::getline(ss, tok, ','); rec.qiDelta = std::stod(tok);
-                std::getline(ss, tok, ','); rec.srDelta = std::stod(tok);
-                std::getline(ss, tok, ','); rec.reward = std::stod(tok);
-                rec.timestamp = ts;
-                historical[ts] = rec;
-            }
-            else if (section == "[INTUITIVE]") {
-                // stateBucket,action,reward1,reward2,...
-                std::stringstream ss(line);
-                std::string bucket;
-                std::getline(ss, bucket, ',');
-                std::string tok;
-                std::getline(ss, tok, ',');
-                int action = std::stoi(tok);
-
-                auto key = std::make_pair(bucket, action);
-                while (std::getline(ss, tok, ',')) {
-                    intuitive[key].push_back(std::stod(tok));
-                }
-            }
-        }
-    }
-
     // ============================================================
     // Persistência — DualSystemResponse
     // ============================================================
 
     void DualSystemResponse::saveToStream(std::ofstream& out) const {
         out << "[QTABLE]" << std::endl;
+        out << "# state,action,q_value" << std::endl;
         for (int s = 0; s < ORPHAN_STATE_COUNT; s++) {
             for (int a = 0; a < INTUITIVE_ACTION_COUNT; a++) {
                 auto sit = Q.find(s);
@@ -806,45 +839,11 @@ namespace nr2 {
             }
         }
         out << "[EPSILON]" << std::endl;
+        out << "# epsilon" << std::endl;
         out << epsilon << std::endl;
         out << "[COUNTERS]" << std::endl;
+        out << "# s1count,s2count" << std::endl;
         out << s1Count << "," << s2Count << std::endl;
-    }
-
-    void DualSystemResponse::loadFromStream(std::ifstream& in) {
-        std::string line;
-        std::string section;
-
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            if (line[0] == '[') {
-                section = line;
-                // Parar se encontrar seção de outro módulo
-                if (section != "[QTABLE]" && section != "[EPSILON]" && section != "[COUNTERS]") {
-                    break;
-                }
-                continue;
-            }
-
-            if (section == "[QTABLE]") {
-                // Formato: state,action,value
-                std::stringstream ss(line);
-                std::string tok;
-                std::getline(ss, tok, ','); int s = std::stoi(tok);
-                std::getline(ss, tok, ','); int a = std::stoi(tok);
-                std::getline(ss, tok, ','); double val = std::stod(tok);
-                Q[s][a] = val;
-            }
-            else if (section == "[EPSILON]") {
-                epsilon = std::stod(line);
-            }
-            else if (section == "[COUNTERS]") {
-                std::stringstream ss(line);
-                std::string tok;
-                std::getline(ss, tok, ','); s1Count = std::stoul(tok);
-                std::getline(ss, tok, ','); s2Count = std::stoul(tok);
-            }
-        }
     }
 
     // ============================================================
@@ -860,6 +859,7 @@ namespace nr2 {
 
         knowledge.saveToStream(out);
         dualSys.saveToStream(out);
+        attackerSys.saveToStream(out);
 
         out.close();
         NS_LOG_UNCOND("INTUITIVE_PERSIST: Conhecimento salvo em " << path);
@@ -887,6 +887,8 @@ namespace nr2 {
                 section = line;
                 continue;
             }
+
+            if (line[0] == '#') continue;
 
             if (section == "[HISTORICAL]") {
                 std::stringstream ss(line);
@@ -928,6 +930,24 @@ namespace nr2 {
                 std::getline(ss, tok, ','); uint32_t s1 = std::stoul(tok);
                 std::getline(ss, tok, ','); uint32_t s2 = std::stoul(tok);
                 dualSys.loadCounters(s1, s2);
+            }
+            else if (section == "[QTABLE_ATTACKER]") {
+                std::stringstream ss(line);
+                std::string tok;
+                std::getline(ss, tok, ','); int s = std::stoi(tok);
+                std::getline(ss, tok, ','); int a = std::stoi(tok);
+                std::getline(ss, tok, ','); double val = std::stod(tok);
+                attackerSys.loadQValue(s, a, val);
+            }
+            else if (section == "[EPSILON_ATTACKER]") {
+                attackerSys.loadEpsilon(std::stod(line));
+            }
+            else if (section == "[COUNTERS_ATTACKER]") {
+                std::stringstream ss(line);
+                std::string tok;
+                std::getline(ss, tok, ','); uint32_t q = std::stoul(tok);
+                std::getline(ss, tok, ','); uint32_t d = std::stoul(tok);
+                attackerSys.loadCounters(q, d);
             }
         }
 
