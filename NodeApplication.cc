@@ -247,6 +247,26 @@ namespace nr2{
                     break;
                 }
 
+                case MessageTypes::ForceReelection:{
+                    // v2 — AP → membro: força re-eleição excluindo um líder específico
+                    // (que foi quarentenado por flodar o AP).
+                    // Payload: IP do líder banido.
+                    // Comportamento: blacklista o IP, limpa myLeader, re-roda
+                    // tiebreakLeader. Se eleito, vira líder novo.
+                    std::string banStr = std::string((char*)buffer);
+                    Ipv6Address banned(banStr.c_str());
+                    this->blacklistedLeaders.insert(banned);
+                    // Remove o líder banido das estruturas locais
+                    if (this->clusterList) this->clusterList->erase(banned);
+                    if (this->neighList)   this->neighList->erase(banned);
+                    if (this->neighCapabilities) this->neighCapabilities->erase(banned);
+                    NS_LOG_INFO("N: FORCE_REELECTION received by " << this->GetNodeIpAddress()
+                                << " — banned=" << banned << ", re-running election");
+                    // Re-rodar eleição com o blacklist em vigor
+                    Simulator::ScheduleNow(&NodeApplication::reelectLeader, this);
+                    break;
+                }
+
                 default:
                     break;
             }
@@ -393,10 +413,56 @@ namespace nr2{
         }
    }
 
+    void NodeApplication::reelectLeader(){
+        if(!this->alive) return;
+        bool wasLeaderBefore = this->isLeader;
+
+        Ipv6Address newLeader = tiebreakLeader();
+        this->myLeader = newLeader;
+
+        if(newLeader == this->GetNodeIpAddress()){
+            // Eleito como novo líder. Se já era líder antes, nada de novo a fazer
+            // (improvável — o líder banido não é quem está re-elegendo).
+            // Se não era líder antes, virar líder agora com timing imediato.
+            if(!wasLeaderBefore){
+                NS_LOG_INFO("N: LS (RE-ELECT) " << this->GetNodeIpAddress());
+
+                // Aumentar potência TX
+                Ptr<LrWpanNetDevice> nodenetdev = DynamicCast<LrWpanNetDevice>(this->GetNode()->GetDevice(1));
+                auto phy = nodenetdev->GetPhy();
+                LrWpanSpectrumValueHelper svh;
+                Ptr<SpectrumValue> psd = svh.CreateTxPowerSpectralDensity(10, 11);
+                phy->SetTxPowerSpectralDensity(psd);
+
+                this->isLeader = true;
+                this->clusterCapabilities = this->capabilities;
+
+                // Registrar imediatamente no AP
+                Simulator::ScheduleNow(&NodeApplication::registerLeader, this);
+
+                // Iniciar heartbeat imediatamente (próximo em 5s)
+                Simulator::Schedule(Seconds(this->heartbeatInterval),
+                                    &NodeApplication::sendHeartbeat, this);
+            }
+        } else {
+            NS_LOG_INFO("N: RE-ELECTED myLeader=" << newLeader
+                        << " (caller=" << this->GetNodeIpAddress() << ")");
+        }
+    }
+
     Ipv6Address NodeApplication::tiebreakLeader(){
         Ipv6Address ipv6 = this->GetNodeIpAddress();
         Ipv6Address selectedLeader;
-        
+
+        // v2 — remover líderes banidos (por ForceReelection) antes da eleição.
+        // Garante que um líder atacante quarentenado pelo AP NÃO seja re-eleito
+        // pelo seu próprio cluster. Aplicação aqui é defensiva — também removemos
+        // do clusterList no handler do ForceReelection, mas refazemos aqui caso
+        // alguma estrutura tenha sido reconstruída entre eventos.
+        for (const auto& banned : this->blacklistedLeaders) {
+            this->clusterList->erase(banned);
+        }
+
         // CORRIGIDO: Usar tamanho do cluster (clusterList->size()) ao invés de neighList->size()
         // Isso garante consistência: todos os nós no cluster usam a mesma métrica
         (*this->clusterList)[ipv6] = this->neighList->size();

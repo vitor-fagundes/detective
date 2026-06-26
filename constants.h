@@ -8,7 +8,9 @@ namespace nr2{
         NewLeaderElection,      // AP → cluster: ordem de re-eleição de líder
         // Ataque UDP Flood
         FloodPacket,            // Pacote de ataque UDP flood (insider threat)
-        // Pipeline de defesa contra atacante (Fase 2)
-        QuarantineOrder         // AP → líder: ordem de quarentena de uma origem suspeita
+        // Pipeline de defesa contra atacante (v1)
+        QuarantineOrder,        // AP → líder: ordem de quarentena de uma origem suspeita
+        // Pipeline de defesa contra líder atacante (v2)
+        ForceReelection         // AP → membros do cluster: forçar re-eleição excluindo líder atual
     };
 }

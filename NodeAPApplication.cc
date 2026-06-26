@@ -55,6 +55,16 @@ namespace nr2{
         this->intuitiveEngine = new IntuitiveLearningEngine();
         this->anomalyDetector = new AnomalyDetector(2.0, 20);  // Z-threshold=2.0, janela=20
 
+        // v2 — defesa contra líder atacando o AP
+        this->apTotalFloodReceived = 0;
+        this->apAlive = true;
+        this->forcedReelectionsTotal = 0;
+        this->apFloodAtLastCycle = 0;
+        this->forcedReelecAtLastCycle = 0;
+        this->apSuspectsAccum = 0;
+        this->apQuarAccum = 0;
+        this->apDoNothingAccum = 0;
+
         for(auto task:*this->tasks){
             task->print();
         }
@@ -99,6 +109,10 @@ namespace nr2{
         // Agendar primeiro ciclo de decisão do aprendizado intuitivo
         // Líderes registram em t=105s; ciclo começa em t=115s (antes do primeiro dispatch em t=150s)
         Simulator::Schedule(Seconds(160.0), &NodeAPApplication::intuitiveDecisionCycle, this);
+
+        // v2 fast-path — monitor de auto-vigilância do AP a cada apMonitorInterval.
+        // Começa junto com o ciclo estratégico; ticks com flood vazio custam ~1 lookup.
+        Simulator::Schedule(Seconds(160.0), &NodeAPApplication::apFloodMonitorCycle, this);
     }
 
     void NodeAPApplication::StopApplication(){
@@ -339,6 +353,44 @@ namespace nr2{
                     break;
                 }
 
+                case MessageTypes::FloodPacket: {
+                    // v2 — atacante (líder comprometido) flodando o AP diretamente.
+                    // Contabiliza por origem + modelo de saturação (análogo ao do
+                    // líder em v1). Se o AP foi quarentenado contra essa origem,
+                    // dropa sem contar (semelhante ao membro v1 com blocklist).
+                    // Se já caiu por saturação anterior, ignora silenciosamente.
+                    if (!this->apAlive) break;
+                    if (this->apQuarantinedLeaders.count(fromIP) > 0) break;
+                    this->apIncomingFloodCount[fromIP]++;
+                    this->apTotalFloodReceived++;
+                    if (this->apTotalFloodReceived >= nr2::NodeApplication::FLOOD_SATURATION_THRESHOLD) {
+                        NS_LOG_INFO("AP_DOWN: saturado por flood (recv="
+                                    << this->apTotalFloodReceived
+                                    << " >= threshold="
+                                    << nr2::NodeApplication::FLOOD_SATURATION_THRESHOLD
+                                    << ") at t=" << Simulator::Now().GetSeconds());
+                        this->apAlive = false;
+                        // Sinal de aprendizado catastrófico: o AP caiu antes do
+                        // próximo ciclo intuitivo. Qualquer decisão pendente no
+                        // ramo AP (lastAttackerDecisions com leader=AP) recebe
+                        // penalty heavy AGORA, porque o pipeline regular não vai
+                        // mais rodar pra computar recompensa observacional.
+                        //   DO_NOTHING: -10 (omissão catastrófica)
+                        //   QUARANTINE: -5  (escolheu mas não chegou a tempo)
+                        Ipv6Address apAddr = GetNodeIpAddress();
+                        auto& aSys = intuitiveEngine->getAttackerSystem();
+                        for (auto& prev : lastAttackerDecisions) {
+                            if (prev.second.leader != apAddr) continue;
+                            double r = (prev.second.action == ATK_DO_NOTHING) ? -10.0 : -5.0;
+                            aSys.updateQ(prev.second.state, prev.second.action, r, ATK_SUSPECT_HIGH);
+                            NS_LOG_INFO("AP_DOWN_PENALTY: suspect=" << prev.first
+                                        << " action=" << AttackerActionNames[prev.second.action]
+                                        << " reward=" << r);
+                        }
+                    }
+                    break;
+                }
+
                 default:
                     break;
             }
@@ -546,10 +598,23 @@ namespace nr2{
         snap.leadersAlive = aliveCount;
         snap.leadersDownThisCycle = downThisCycle;
 
-        // [4.5] Fase 2 — defesa contra UDP flooder (membro→líder)
+        // [4.5] Fase 2 — defesa contra UDP flooder (membro→líder, attackMode=1)
         // Roda antes do processamento de órfãos pra que a próxima rodada já veja o
         // efeito da quarentena (e o líder talvez deixe de ser anômalo).
         processAttackersIntuitively(snap);
+
+        // [4.6] v2 — defesa contra líder atacando AP (attackMode=2)
+        // A detecção/mitigação flood→AP roda no monitor rápido (apFloodMonitorCycle,
+        // cadência apMonitorInterval), porque o AP satura em segundos e morto não há
+        // agente. Aqui o ciclo estratégico (5s) só consolida telemetria via deltas
+        // cumulativos (o monitor esvazia apIncomingFloodCount a cada tick).
+        snap.apIncomingFloodTotal = (uint32_t)(apTotalFloodReceived - apFloodAtLastCycle);
+        apFloodAtLastCycle = apTotalFloodReceived;
+        snap.apAliveSnapshot = apAlive;
+        snap.forcedReelectionsThisCycle = forcedReelectionsTotal - forcedReelecAtLastCycle;
+        forcedReelecAtLastCycle = forcedReelectionsTotal;
+        snap.apQuarantinedLeadersCount = (uint32_t)apQuarantinedLeaders.size();
+        processAPAttackersIntuitively(snap);  // drena acumuladores do monitor → snap
 
         // [5] Processar órfãos com decisão individual por órfão
         processOrphansIntuitively(snap);
@@ -1050,7 +1115,9 @@ namespace nr2{
                 << "suspectsCount,actionsAttackerQuarantine,actionsAttackerDoNothing,"
                 << "qAtkDNHigh,qAtkQuarHigh,qAtkDNLow,qAtkQuarLow,atkEpsilon,"
                 << "smartTransferOk,smartTransferNoDonor,smartRedundancyOk,"
-                << "leadersAlive,leadersDownThisCycle"
+                << "leadersAlive,leadersDownThisCycle,"
+                << "apIncomingFloodTotal,apQuarantinedLeadersCount,"
+                << "forcedReelectionsThisCycle,apAlive"
                 << std::endl;
 
         for(const auto& snap : history){
@@ -1084,7 +1151,11 @@ namespace nr2{
                     << snap.smartTransferNoDonor << ","
                     << snap.smartRedundancyOk << ","
                     << snap.leadersAlive << ","
-                    << snap.leadersDownThisCycle
+                    << snap.leadersDownThisCycle << ","
+                    << snap.apIncomingFloodTotal << ","
+                    << snap.apQuarantinedLeadersCount << ","
+                    << snap.forcedReelectionsThisCycle << ","
+                    << (snap.apAliveSnapshot ? 1 : 0)
                     << std::endl;
         }
         logFile.close();
@@ -1344,6 +1415,181 @@ namespace nr2{
 
         // 5) Janela consumida: limpar contadores acumulados para a próxima rodada.
         leaderSourceCounts.clear();
+    }
+
+    // ============================================================
+    // v2 — Pipeline simétrico contra líder atacando o AP
+    // ============================================================
+    // Estrutura paralela ao processAttackersIntuitively. Diferenças vs v1:
+    //   - Origem dos contadores: apIncomingFloodCount (observação direta no AP)
+    //   - Detecção: detectFlooders sobre um único "cluster virtual" (key=AP_addr)
+    //   - Quarentena: AP descarta localmente (apQuarantinedLeaders), NÃO envia
+    //     QuarantineOrder pra ninguém
+    //   - Recovery: ForceReelection ao cluster cujo líder foi quarentenado
+    //   - Reuso da mesma AttackerDualSystem (Q-table compartilhada — mesma
+    //     estrutura de decisão, política única através das duas camadas)
+    void NodeAPApplication::apFloodMonitorCycle() {
+        // AP morto = sem agente. Não monitora nem reagenda (coerente com o modelo:
+        // se a defesa falhou e o AP saturou, não há nada nele pra reagir).
+        if (!apAlive) return;
+
+        if (!apIncomingFloodCount.empty()) {
+            // 1) Detecção DIRETA no AP. Diferente do líder (v1), aqui nenhum nó
+            //    legítimo envia FloodPacket — então qualquer origem acima de um
+            //    piso baixo é flooder confirmado. NÃO reusa detectFlooders: o
+            //    limiar absoluto (100 pkts) e o requisito de >=3 origens dele são
+            //    calibrados pra janela de 5s do cenário do líder e nunca disparariam
+            //    na janela curta deste monitor (~AP_ABS_FLOOR pkts).
+            Ipv6Address apAddr = GetNodeIpAddress();
+            std::map<Ipv6Address, double> suspects;
+            for (const auto& s : apIncomingFloodCount) {
+                if (s.second < AP_ABS_FLOOR) continue;
+                // z sintético: flooder confirmado → SUSPECT_HIGH, escala com volume.
+                double z = ATTACKER_Z_HIGH * ((double)s.second / (double)AP_ABS_FLOOR);
+                suspects[s.first] = z;
+            }
+            apSuspectsAccum += (uint32_t)suspects.size();
+
+            auto& attackerSys = intuitiveEngine->getAttackerSystem();
+
+            // 2) Recompensa observacional das decisões anteriores (mesma lógica de v1).
+            for (auto& prev : lastAttackerDecisions) {
+                const Ipv6Address& suspect = prev.first;
+                if (prev.second.leader != apAddr) continue;  // só o ramo AP
+
+                AttackerState  pState  = prev.second.state;
+                AttackerAction pAction = prev.second.action;
+
+                bool suspectPersists = (suspects.count(suspect) > 0);
+                AttackerState nextState = suspectPersists
+                    ? AttackerDualSystem::stateFromZScore(suspects[suspect])
+                    : ATK_CLEAR;
+
+                double reward;
+                if (pAction == ATK_QUARANTINE) {
+                    int otherSuspects = 0;
+                    for (const auto& s : suspects) {
+                        if (s.first == suspect) continue;
+                        otherSuspects++;
+                    }
+                    reward = (otherSuspects == 0) ? +10.0 : -2.0;
+                } else {
+                    if (!suspectPersists)                        reward = +1.0;
+                    else if (nextState == ATK_SUSPECT_HIGH)      reward = -5.0;
+                    else                                          reward = -2.0;
+                }
+
+                attackerSys.updateQ(pState, pAction, reward, nextState);
+
+                NS_LOG_INFO("ATK_AP_REWARD: suspect=" << suspect
+                            << " state=" << AttackerStateNames[pState]
+                            << " action=" << AttackerActionNames[pAction]
+                            << " reward=" << reward
+                            << " persisted=" << suspectPersists
+                            << " nextState=" << AttackerStateNames[nextState]);
+            }
+            // Limpar decisões "do AP" (v1 limpa as suas no próprio ciclo)
+            for (auto it = lastAttackerDecisions.begin(); it != lastAttackerDecisions.end();) {
+                if (it->second.leader == apAddr) it = lastAttackerDecisions.erase(it);
+                else ++it;
+            }
+
+            // 3) Decisões deste tick — com override determinístico.
+            for (const auto& s : suspects) {
+                const Ipv6Address& suspect = s.first;
+                double z = s.second;
+                AttackerState state = AttackerDualSystem::stateFromZScore(z);
+
+                if (globallyQuarantined.count(suspect) > 0) continue;
+
+                // Volume do suspeito na janela atual do monitor (antes do clear).
+                uint32_t windowCount = 0;
+                auto fc = apIncomingFloodCount.find(suspect);
+                if (fc != apIncomingFloodCount.end()) windowCount = fc->second;
+
+                // Override: evidência forte → quarentena imediata, sem esperar o
+                // ε-greedy explorar (o AP satura rápido demais pra isso).
+                bool hardOverride = (z >= AP_Z_HARD && windowCount >= AP_ABS_FLOOR);
+                AttackerAction action = hardOverride
+                    ? ATK_QUARANTINE
+                    : attackerSys.selectAction(state);
+
+                if (action == ATK_QUARANTINE) apQuarAccum++;
+                else                          apDoNothingAccum++;
+
+                NS_LOG_INFO("ATK_AP_DECISION: suspect=" << suspect
+                            << " z=" << z
+                            << " state=" << AttackerStateNames[state]
+                            << " action=" << AttackerActionNames[action]
+                            << (hardOverride ? " (HARD_OVERRIDE)" : ""));
+
+                if (action == ATK_QUARANTINE) {
+                    // Quarentena no AP = drop local + force re-election do cluster.
+                    apQuarantinedLeaders.insert(suspect);
+                    globallyQuarantined[suspect] = Simulator::Now().GetSeconds();
+                    NS_LOG_INFO("AP_QUARANTINE_LEADER: " << suspect
+                                << " — drop local + force re-election do cluster");
+                    sendForceReelection(suspect);
+                }
+
+                PendingDecision pd{state, action, apAddr};
+                lastAttackerDecisions[suspect] = pd;
+            }
+
+            attackerSys.decayEpsilonIfActive((int)suspects.size());
+            apIncomingFloodCount.clear();  // janela do monitor consumida
+        }
+
+        // Reagenda enquanto o AP estiver vivo.
+        Simulator::Schedule(Seconds(apMonitorInterval),
+                            &NodeAPApplication::apFloodMonitorCycle, this);
+    }
+
+    // Telemetria-only: a detecção/mitigação flood→AP migrou para o monitor rápido
+    // (apFloodMonitorCycle). Aqui o ciclo estratégico (5s) apenas drena os
+    // acumuladores preenchidos pelo monitor para o snapshot do CSV.
+    void NodeAPApplication::processAPAttackersIntuitively(IntuitiveSnapshot& snap) {
+        snap.suspectsCount             += apSuspectsAccum;
+        snap.actionsAttackerQuarantine += apQuarAccum;
+        snap.actionsAttackerDoNothing  += apDoNothingAccum;
+        apSuspectsAccum = apQuarAccum = apDoNothingAccum = 0;
+    }
+
+    void NodeAPApplication::sendForceReelection(Ipv6Address badLeader) {
+        // Marca o líder ruim como morto no clusterInfoMap pra evitar dispatch
+        // de tarefas. O nó em si continua "vivo" mas isolado pela quarentena.
+        auto it = clusterInfoMap.find(badLeader);
+        if (it != clusterInfoMap.end()) {
+            it->second.leaderAlive = false;
+        }
+
+        // Enviar ForceReelection a todos os membros que tinham este líder.
+        // Payload: IP do líder a ser excluído da próxima eleição.
+        std::stringstream ts;
+        badLeader.Print(ts);
+        std::string payload = ts.str();
+        uint32_t notified = 0;
+
+        for (uint32_t j = 0; j < networkNodes.GetN(); j++) {
+            Ptr<NodeApplication> nApp = DynamicCast<NodeApplication>(
+                networkNodes.Get(j)->GetApplication(0));
+            if (!nApp || !nApp->isNodeAlive()) continue;
+            if (nApp->getMyLeader() != badLeader) continue;
+            if (nApp->GetNodeIpAddress() == badLeader) continue;  // não notifica ele mesmo
+
+            // Send via unicast
+            Ptr<Packet> p = Create<Packet>((uint8_t*)payload.c_str(), payload.size() + 1);
+            MyTag tag;
+            tag.SetSimpleValue(MessageTypes::ForceReelection);
+            p->AddPacketTag(tag);
+            Inet6SocketAddress remote(nApp->GetNodeIpAddress(), 2020);
+            m_socket->SendTo(p, 0, remote);
+            notified++;
+        }
+
+        forcedReelectionsTotal++;
+        NS_LOG_INFO("FORCE_REELECTION: badLeader=" << badLeader
+                    << " notificou " << notified << " membros");
     }
 
     // ============================================================

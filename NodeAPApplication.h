@@ -87,6 +87,55 @@ namespace nr2{
             std::map<Ipv6Address, double>  globallyQuarantined;
             static constexpr double QUARANTINE_TTL = 60.0;  // 12 ciclos de 5s
 
+            // ============================================================
+            // v2 — Defesa contra líder atacando o AP
+            // ============================================================
+            // Contador de FloodPackets recebidos pelo AP, por origem.
+            // Equivalente ao incomingPacketCount do líder em v1, mas observado
+            // diretamente pela vítima (AP) sem precisar de heartbeat.
+            std::map<Ipv6Address, uint32_t>  apIncomingFloodCount;
+
+            // Total acumulado de FloodPackets recebidos no AP — modelo de
+            // saturação análogo ao do líder em v1. Quando atinge
+            // FLOOD_SATURATION_THRESHOLD, AP "cai" (apAlive=false).
+            uint64_t                         apTotalFloodReceived;
+            bool                             apAlive;
+
+            // Líderes quarentenados pelo pipeline AP (subset de
+            // globallyQuarantined; usado pra disparar ForceReelection e contar
+            // telemetria separada do v1).
+            std::set<Ipv6Address>            apQuarantinedLeaders;
+
+            // Contador cumulativo de re-eleições forçadas (telemetria).
+            uint32_t                         forcedReelectionsTotal;
+
+            // ------------------------------------------------------------
+            // v2 fast-path — auto-vigilância do AP
+            // ------------------------------------------------------------
+            // O detector vive NO AP (a própria vítima). Com o ciclo estratégico
+            // de 5s, o AP satura (FLOOD_SATURATION_THRESHOLD pkts) em segundos —
+            // antes de qualquer decisão — e, morto, não há agente pra mitigar.
+            // Por isso a detecção/mitigação flood→AP roda num timer rápido
+            // dedicado (apMonitorInterval), que age MUITO antes da saturação.
+            double                           apMonitorInterval = 1.0;  // s
+
+            // Telemetria desacoplada: o monitor rápido esvazia apIncomingFloodCount
+            // a cada tick, então o ciclo estratégico (5s) lê deltas cumulativos.
+            uint64_t                         apFloodAtLastCycle;       // apTotalFloodReceived no último ciclo 5s
+            uint32_t                         forcedReelecAtLastCycle;  // forcedReelectionsTotal no último ciclo 5s
+            // Acumuladores preenchidos pelo monitor rápido, drenados pelo ciclo 5s.
+            uint32_t                         apSuspectsAccum;
+            uint32_t                         apQuarAccum;
+            uint32_t                         apDoNothingAccum;
+
+            // Override determinístico: o orçamento de tempo até saturar é minúsculo,
+            // então não dá pra esperar o ε-greedy explorar. Se a evidência é forte
+            // (z alto E volume na janela acima do piso), quarentena na hora — espelha
+            // o fallback de limiar absoluto do detectFlooders (v1). A decisão ainda
+            // alimenta o Q-learning (aprende que o override foi acertado).
+            static constexpr double          AP_Z_HARD    = 4.0;
+            static constexpr uint32_t        AP_ABS_FLOOR = 20;  // pkts na janela do monitor
+
         public:
             void setup();
             void generateTasks(int totalDuration);
@@ -138,6 +187,24 @@ namespace nr2{
             // Chamada de dentro do intuitiveDecisionCycle. snap recebe os contadores
             // do ramo atacante deste ciclo para telemetria do CSV.
             void processAttackersIntuitively(IntuitiveSnapshot& snap);
+
+            // v2 — pipeline simétrico ao processAttackersIntuitively, mas pra
+            // atacantes que são líderes flodando o AP. Detecta suspeitos sobre
+            // apIncomingFloodCount, decide via mesmo AttackerDualSystem, executa
+            // quarentena local no AP (drop) + ForceReelection no cluster afetado.
+            void processAPAttackersIntuitively(IntuitiveSnapshot& snap);
+
+            // v2 fast-path — monitor de auto-vigilância do AP. Roda a cada
+            // apMonitorInterval (independente do ciclo estratégico de 5s):
+            // detecta flood→AP, decide via AttackerDualSystem (com override
+            // determinístico) e dispara quarentena + ForceReelection ANTES da
+            // saturação. Se o AP cair, não reagenda (AP morto não monitora).
+            void apFloodMonitorCycle();
+
+            // Envia ForceReelection a todos os membros do cluster cujo líder
+            // está sendo quarentenado, pedindo que re-elejam um novo líder
+            // excluindo o IP do antigo.
+            void sendForceReelection(Ipv6Address badLeader);
             // Envia ordem de quarentena a um líder específico, payload = IP alvo.
             void sendQuarantineOrder(Ipv6Address leaderAddr, Ipv6Address target);
 

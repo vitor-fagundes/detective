@@ -17,9 +17,15 @@ A arquitetura mantém o motor de aprendizado intuitivo do SYNAPT (Dual-System S1
 
 1. **Detecção dual de fluxo anômalo** — Z-score intra-cluster + threshold absoluto
 2. **AttackerDualSystem** — Q-table 3×2 paralela ao motor de órfãos, com ações `DO_NOTHING` e `QUARANTINE`
-3. **Modelo de saturação de líder** — simula o efeito kinético do DDoS: quando um líder recebe mais que `FLOOD_SATURATION_THRESHOLD` pacotes acumulados, ele cai (`alive=false`)
+3. **Modelo de saturação da vítima** — simula o efeito kinético do DDoS: quando a vítima recebe mais que `FLOOD_SATURATION_THRESHOLD` pacotes acumulados, ela cai (`alive=false`)
 
-Quando a quarentena é rápida o suficiente, o líder sobrevive. Quando o atacante satura antes da detecção, o líder cai e o pipeline de órfãos do SYNAPT entra em ação para reabsorver os membros saudáveis em clusters vizinhos.
+### Dois cenários de ameaça (`--attackMode`)
+
+O DETECTIVE cobre **dois alvos de ataque insider**, selecionáveis por flag:
+
+- **v1 — Membro → Líder (`attackMode=1`):** nós membros comprometidos floodam o líder do seu cluster. O líder reporta as contagens por origem ao AP via heartbeat estendido; o AP detecta (Z-score intra-cluster) e ordena quarentena (`QuarantineOrder`). Quando a quarentena é rápida, o líder sobrevive; quando o atacante satura antes, o líder cai e o **pipeline de órfãos** do SYNAPT reabsorve os membros saudáveis.
+
+- **v2 — Líder → AP (`attackMode=2`):** líderes comprometidos floodam o AP (a vítima é o próprio orquestrador). Como **o detector vive no AP**, ele precisa identificar e conter os flooders **antes de saturar** — um AP caído não tem agente para reagir. Isso exige um **monitor rápido de auto-vigilância** (sub-ciclo de 1 s, independente do ciclo estratégico de 5 s) com **detecção direta** e **quarentena determinística**, disparando `ForceReelection` para os clusters re-elegerem líderes banindo os comprometidos. Ver [Pipeline de Defesa v2](#pipeline-de-defesa-v2--líder-atacando-o-ap).
 
 ---
 
@@ -28,9 +34,11 @@ Quando a quarentena é rápida o suficiente, o líder sobrevive. Quando o atacan
 ```
 contaski.cc              — Entrada principal: configura rede, seleciona atacantes, agenda ataque
 NodeApplication.cc/h     — Aplicação de cada nó: clustering, beacon, similaridade, eleição,
-                           contador de flood recebido, modelo de saturação
+                           contador de flood recebido, modelo de saturação,
+                           (v2) re-eleição forçada com blacklist de líder banido
 NodeAPApplication.cc/h   — Orquestrador AP: ciclo intuitivo, pipelines de defesa e recuperação,
-                           smart-quarantine, telemetria CSV
+                           smart-quarantine, telemetria CSV,
+                           (v2) saturação do próprio AP + monitor rápido de auto-vigilância
 IntuitiveLearning.cc/h   — Motor: DistributedLearning, DualSystemResponse (órfão 3×3),
                            AttackerDualSystem (atacante 3×2), KnowledgeNetworks
 AnomalyDetector.cc/h     — Detecção: Z-score multivariado (líderes) + detectFlooders
@@ -38,7 +46,7 @@ AnomalyDetector.cc/h     — Detecção: Z-score multivariado (líderes) + detec
 FloodAttack.cc/h         — Módulo isolado de ataque UDP flood; target fixo após startFlood
 capabilities.cc/h        — Vetores de capacidades e similaridade (Eq. 1 do CONTASKI)
 task.cc/h                — Modelo de tarefas com capacidades requeridas e quorum
-constants.h              — Enum de tipos de mensagem (inclui FloodPacket, QuarantineOrder)
+constants.h              — Enum de tipos de mensagem (FloodPacket, QuarantineOrder, ForceReelection)
 MyTag.cc/h               — Tag NS-3 para identificação de tipo de mensagem UDP
 run_detective.sh         — Script de execução cumulativa para o paper (3 scales × 35 runs)
 ```
@@ -125,6 +133,49 @@ Quando líderes caem por saturação, seus membros saudáveis viram órfãos. O 
 
 ---
 
+## Pipeline de Defesa v2 — Líder atacando o AP
+
+No cenário `attackMode=2`, a vítima é o **próprio AP**. Isso muda a arquitetura de forma fundamental: **o detector roda dentro do AP**, então se o AP saturar não há agente para mitigar. A defesa precisa, portanto, **vencer a corrida contra a saturação** — detectar e conter antes da queda.
+
+### Por que o ciclo de 5 s não basta
+
+Com `attackRate=50 pkts/s` e 5 líderes atacando, o AP acumula ~250 pkts/s; o `FLOOD_SATURATION_THRESHOLD=500` é atingido em ~2 s. O ciclo estratégico de 5 s **perde a corrida por construção** — a primeira tick após o ataque já encontraria o AP saturado. Além disso, o ε-greedy puro pode explorar `DO_NOTHING` nas primeiras decisões, atrasando ainda mais a quarentena.
+
+### Monitor rápido de auto-vigilância (`apFloodMonitorCycle`)
+
+A detecção/mitigação do ramo flood→AP roda num **timer dedicado a cada `apMonitorInterval = 1.0 s`**, desacoplado do ciclo estratégico de 5 s (que continua cuidando de órfãos/anomalias de líder). Se o AP cair, o monitor **não reagenda** — modelo coerente com "AP morto não monitora".
+
+1. **Detecção direta** (não reusa `detectFlooders`): no AP, **nenhum nó legítimo envia `FloodPacket`**, então qualquer origem com `count ≥ AP_ABS_FLOOR (=20)` na janela do monitor é flooder confirmado. (O `detectFlooders` é calibrado para janela de 5 s — limiar absoluto de 100 pkts e ≥3 origens — e não dispararia na janela curta de 1 s.) Z sintético: `z = ATTACKER_Z_HIGH × (count / AP_ABS_FLOOR)` → classifica como `SUSPECT_HIGH`.
+2. **Override determinístico**: como o orçamento de tempo até saturar é minúsculo, evidência forte (`z ≥ AP_Z_HARD (=4.0)` **e** `count ≥ AP_ABS_FLOOR`) dispara **quarentena imediata**, sem esperar o ε-greedy explorar. A decisão ainda alimenta o Q-learning (aprende que o override foi acertado).
+3. **Quarentena + recuperação**: insere em `apQuarantinedLeaders` + `globallyQuarantined`, o `recvCallback` passa a dropar `FloodPacket` daquela origem (a saturação congela), e dispara `sendForceReelection`.
+
+### Re-eleição forçada (`ForceReelection`)
+
+`sendForceReelection(badLeader)`:
+- Marca `leaderAlive = false` no `clusterInfoMap` (impede dispatch de tarefas ao líder ruim).
+- Envia a mensagem `ForceReelection` (payload = IP do líder banido) a **todos os membros** cujo `myLeader == badLeader`.
+
+No lado do membro (`NodeApplication`):
+- Insere o IP em `blacklistedLeaders` e dispara `reelectLeader()` (re-eleição imediata, sem o delay do clustering inicial).
+- `tiebreakLeader()` **pula candidatos em `blacklistedLeaders`**, garantindo que o líder comprometido **não seja re-eleito**.
+
+### Telemetria desacoplada
+
+Como o monitor esvazia `apIncomingFloodCount` a cada 1 s, o ciclo estratégico de 5 s consolida a telemetria via **deltas cumulativos** (`apTotalFloodReceived`, `forcedReelectionsTotal`) e drena acumuladores preenchidos pelo monitor (`processAPAttackersIntuitively` virou telemetria-only). Colunas novas no CSV: `apIncomingFloodTotal`, `apQuarantinedLeadersCount`, `forcedReelectionsThisCycle`, `apAlive`.
+
+### Diferença-chave vs v1
+
+| | v1 (membro→líder) | v2 (líder→AP) |
+|---|---|---|
+| Vítima | líder do cluster | o próprio AP (orquestrador/agente) |
+| Observação | indireta (heartbeat do líder) | **direta** (AP conta o flood que recebe) |
+| Detecção | Z-score intra-cluster + absoluto | **direta** (qualquer flood ≥ piso é hostil) |
+| Cadência | ciclo de 5 s | **monitor de 1 s** + override determinístico |
+| Recuperação | pipeline de órfãos (reativo) | **ForceReelection** (banir líder + re-eleger) |
+| Se a vítima cai | órfãos reabsorvidos | **game over** (sem agente) → a defesa precisa prevenir |
+
+---
+
 ## Modelo de Saturação do Líder
 
 NS-3 não modela exaustão de recurso por padrão. Para simular o efeito kinético do DDoS, cada nó mantém um contador `totalFloodReceived` que cresce a cada `FloodPacket` recebido enquanto for líder. Quando atinge `FLOOD_SATURATION_THRESHOLD`:
@@ -147,6 +198,10 @@ A partir desse momento:
 | 250 | 5s | 1.7s | saturação dominante |
 | **500** (padrão) | **10s** | **3.3s** | **mix interessante** |
 | 1000 | 20s | 6.7s | framework quase sempre vence |
+
+### Saturação do AP (v2)
+
+No `attackMode=2`, o mesmo modelo se aplica ao **AP**: `apTotalFloodReceived` cresce a cada `FloodPacket` recebido e, ao atingir `FLOOD_SATURATION_THRESHOLD`, `apAlive=false`. A diferença crucial é que **não há recuperação** — o AP é o agente, então sua queda é terminal (game over para a defesa). Por isso o ramo v2 aposta em **prevenção rápida** (monitor de 1 s) em vez de reação pós-queda. Nas suítes validadas (5 atacantes, threshold 500), o monitor quarentena os flooders em ~1 s (t≈301), bem antes dos 500 pacotes, e o AP **nunca cai**.
 
 ---
 
@@ -199,7 +254,15 @@ Modela um adversário insider com **consciência mínima da topologia local**, s
 | `ATTACKER_Z_HIGH` | 4.0 | Z mínimo para SUSPECT_HIGH |
 | `ABSOLUTE_FLOOD_THRESHOLD` | 100 pkts/janela | Detector de fallback absoluto |
 | `QUARANTINE_TTL` | 60.0 s | Tempo até IP poder ser re-quarentenado |
-| `FLOOD_SATURATION_THRESHOLD` | 500 pkts | Saturação do líder por flood acumulado |
+| `FLOOD_SATURATION_THRESHOLD` | 500 pkts | Saturação da vítima (líder em v1 / AP em v2) por flood acumulado |
+
+### Defesa do AP (v2 — `attackMode=2`)
+
+| Parâmetro | Valor | Descrição |
+|---|---|---|
+| `apMonitorInterval` | 1.0 s | Cadência do monitor rápido de auto-vigilância do AP |
+| `AP_ABS_FLOOR` | 20 pkts | Piso na janela do monitor acima do qual a origem é flooder confirmado |
+| `AP_Z_HARD` | 4.0 | Z mínimo para override determinístico (quarentena imediata) |
 
 ### Recompensas (atacante — observacional)
 
@@ -252,6 +315,14 @@ Modela um adversário insider com **consciência mínima da topologia local**, s
   --floodSaturationThreshold=750 \
   --knowledgePath=results-detective/300_attack10/knowledge.dat"
 
+# v2 — líderes atacando o AP (attackMode=2)
+./ns3 run "scratch/detective/contaski \
+  --nNodes=250 --run=1 \
+  --nAttackers=5 \
+  --attackMode=2 \
+  --floodSaturationThreshold=500 \
+  --knowledgePath=results-detective/250_attack5_mode2/knowledge.dat"
+
 # Desabilitar modelo de saturação (--floodSaturationThreshold=0)
 ./ns3 run "scratch/detective/contaski --nNodes=200 --floodSaturationThreshold=0 --nAttackers=5"
 ```
@@ -266,7 +337,7 @@ Modela um adversário insider com **consciência mínima da topologia local**, s
 | `--attackStartTime` | 300.0 | Momento de início do flood (s) |
 | `--attackRate` | 50.0 | Taxa do flood (pkts/s) |
 | `--attackPayloadSize` | 64 | Tamanho do payload (bytes) |
-| `--attackMode` | 1 | 1=membro→líder, 2=líder→AP (reservado para v2) |
+| `--attackMode` | 1 | 1=membro→líder (v1), 2=líder→AP (v2) — em mode 2 os atacantes são selecionados entre os líderes |
 | `--floodSaturationThreshold` | 500 | Pacotes para líder cair (0 = desabilitado) |
 
 ---
@@ -277,10 +348,11 @@ Modela um adversário insider com **consciência mínima da topologia local**, s
 
 - `--run=1` fixo em todas as execuções
 - Capabilities regenerada por rodada (`std::random_device`)
-- `knowledge.dat` cumulativo entre rodadas (transferência de conhecimento)
+- `knowledge.dat` cumulativo entre rodadas (transferência de conhecimento), **por escala** (escalas são independentes — seguro rodar em paralelo)
 - Resume parcial: pula runs que já têm `IntuitiveStats.csv`
 - Trap em SIGINT/SIGTERM: mata árvore de processos limpa em Ctrl+C
 - `--no-build` em cada `./ns3 run` (build apenas no início)
+- **`ATTACK_MODE` default = 2** (v2, líder→AP); o label do cenário inclui o modo (`${N}_attack${N_ATTACKERS}_mode${ATTACK_MODE}`), então mode 1 e mode 2 nunca colidem nos diretórios de resultado
 
 ```bash
 # Padrão: N={200, 250, 300}, 35 runs cada
@@ -291,6 +363,14 @@ Modela um adversário insider com **consciência mínima da topologia local**, s
 
 # Uma scale específica
 ./scratch/detective/run_detective.sh scale 250
+
+# Rodar o cenário v1 (membro→líder) em vez do default v2
+ATTACK_MODE=1 ./scratch/detective/run_detective.sh
+
+# Escalas em paralelo (independentes — knowledge.dat é por escala)
+SCALES=200 ./scratch/detective/run_detective.sh &
+SCALES=250 ./scratch/detective/run_detective.sh &
+SCALES=300 ./scratch/detective/run_detective.sh &
 
 # Overrides via env var
 N_RUNS=10 ./scratch/detective/run_detective.sh
@@ -304,11 +384,11 @@ N_ATTACKERS=10 SAT_THRESHOLD=750 ./scratch/detective/run_detective.sh
 
 ```
 scratch/detective/results-detective/
-├── 200_attack5/
+├── 200_attack5_mode2/                        (label = N_attack<nAtt>_mode<attackMode>)
 │   ├── knowledge.dat                         (cumulativo, herdado entre runs)
 │   ├── run_001/
 │   │   ├── simulation.log                    (stdout completo)
-│   │   ├── IntuitiveStats.csv                (31 colunas — telemetria por ciclo)
+│   │   ├── IntuitiveStats.csv                (telemetria por ciclo)
 │   │   ├── IntuitiveQValues.txt              (Q-tables finais: órfão 3×3 + atacante 3×2)
 │   │   ├── APStats.txt                       (tarefas dispatchadas vs aceitas)
 │   │   ├── knowledge_snapshot.dat            (snapshot do knowledge ao fim)
@@ -316,9 +396,10 @@ scratch/detective/results-detective/
 │   │   └── tasksFile-200.txt                 (tarefas geradas para esta run)
 │   ├── run_002/
 │   └── ...
-├── 250_attack5/
-└── 300_attack5/
+├── 250_attack5_mode2/
+└── 300_attack5_mode2/
 ```
+(mode 1 usaria o label `200_attack5_mode1`, etc.)
 
 ### Colunas do `IntuitiveStats.csv`
 
@@ -332,6 +413,7 @@ scratch/detective/results-detective/
 | **Q-values atacante** | `qAtkDNHigh`, `qAtkQuarHigh`, `qAtkDNLow`, `qAtkQuarLow`, `atkEpsilon` |
 | **Smart-quarantine** | `smartTransferOk`, `smartTransferNoDonor`, `smartRedundancyOk` |
 | **Saturação** | `leadersAlive`, `leadersDownThisCycle` |
+| **Defesa do AP (v2)** | `apIncomingFloodTotal`, `apQuarantinedLeadersCount`, `forcedReelectionsThisCycle`, `apAlive` |
 
 ---
 
@@ -392,6 +474,22 @@ Exemplo N=200 (35 runs):
 
 Política converge em **15-20 runs** para Q(SUSPECT_HIGH, QUARANTINE) ≈ Q(SUSPECT_LOW, QUARANTINE) ≈ 11-16, indicando que **quarentenar é sempre preferível à omissão** independente da intensidade da suspeita.
 
+### v2 — Líder → AP (`attackMode=2`)
+
+Suíte completa para N={200, 250, 300}, 5 líderes atacantes, threshold 500, 35 runs/escala (3 escalas em paralelo).
+
+| Scale | Runs | AP saturou (`AP_DOWN`) | Líderes atacantes quarentenados | `ForceReelection` |
+|---|---|---|---|---|
+| N=200 | 35/35 | **0** | 5/5 por run | 5/run |
+| N=250 | 35/35 | **0** | 5/5 por run | 5/run |
+| N=300 | 35/35 | **0** | 5/5 por run | 5/run |
+
+- **AP nunca caiu** em nenhuma das 105 runs: o monitor de 1 s detecta e quarentena os flooders em t≈301 (≈1 s após o início do ataque), muito antes dos 500 pacotes de saturação (~t=305).
+- **Recall ≈ 100%** dos líderes atacantes — diferente da v1 (74-83%), no AP a detecção é inequívoca (nenhum nó legítimo envia `FloodPacket` ao AP, não há ghost-leader na observação), então todos os 5 são vistos e contidos.
+- **Re-eleição**: cada líder quarentenado dispara `ForceReelection`; os membros re-elegem banindo o IP comprometido. SR sofre queda transitória durante a janela de re-eleição (proporcional ao nº de clusters afetados) e estabiliza em seguida.
+
+> Métricas agregadas de QI/SR/throughput por ciclo estão nos `IntuitiveStats.csv` de cada run (colunas da categoria *Defesa do AP*), prontas para os gráficos do paper.
+
 ---
 
 ## Notas Metodológicas
@@ -417,19 +515,24 @@ Nenhuma consulta a `isNodeCompromised()` do simulador. O framework opera apenas 
 
 A lógica de transferência de doador (`findCapabilityDonor`, `transferDonorToCluster`) só dispara em cenários onde a remoção do suspeito quebraria a redundância de capabilities do cluster. Sob `SIMILARITY_THRESHOLD=0.95` (padrão), isso é raro — clusters por construção são quase idênticos. Validado em runtime sob threshold relaxado (0.80). Mantida como rede de segurança defensiva.
 
+### Crash intermitente de deserialização (pré-existente)
+
+Em ~6% das runs de N=250 observou-se um abort (`SIGABRT`) por over-read em `Header::Deserialize` por volta de **t≈149 s — antes do ataque (t=300)**, na fase densa de clustering/dispatch de tarefas. Está **fora dos caminhos de defesa** (v1 e v2 só ativam com tráfego de flood em t≥300) e é dependente de topologia/RNG (N=200 e N=300 não exibiram). Mitigação usada nas suítes: o `run_detective.sh` faz `continue` em FAIL; as runs afetadas foram refeitas (com renumeração para manter a sequência cumulativa contígua). **A investigar** separadamente — provável fragilidade no Serialize/Deserialize de mensagem (heartbeat estendido ou task) sob alta densidade.
+
 ---
 
 ## Relação com sectional e synapt
 
-| Dimensão | sectional | synapt-v1 | synapt-v2 | **detective-v1** |
-|---|---|---|---|---|
-| Cenário de stress | Nenhum (baseline) | Falha de líder (waves) | Falha de membro | **Ataque UDP DoS interno** |
-| Detecção | Não | Z-score (líderes) | Z-score (líderes) | **Z-score (líderes) + flooders (origens)** |
-| Reação | Q-Learning (RL3) | Dual-System S1/S2 | Dual-System + cluster state | **Dual-System (órfão + atacante)** |
-| Aprendizado | Q-table reativa | Contínuo (5s cycle) | Contínuo | **Contínuo** |
-| Modelo de ameaça | — | Falha externa | Falha externa | **Insider compromise (DDoS)** |
-| Saturação modelada | — | — | — | **Sim (limite de pacotes recebidos)** |
-| Recovery | — | Pipeline órfão | Cluster-level + órfão | **Pipeline órfão (reativo a DoS)** |
+| Dimensão | sectional | synapt-v1 | synapt-v2 | detective-v1 | **detective-v2** |
+|---|---|---|---|---|---|
+| Cenário de stress | Nenhum (baseline) | Falha de líder (waves) | Falha de membro | Ataque UDP DoS (membro→líder) | **Ataque UDP DoS (líder→AP)** |
+| Vítima | — | líder | membro | líder | **AP (orquestrador/agente)** |
+| Detecção | Não | Z-score (líderes) | Z-score (líderes) | Z-score (líderes) + flooders (origens) | **Direta no AP (qualquer flood é hostil)** |
+| Reação | Q-Learning (RL3) | Dual-System S1/S2 | Dual-System + cluster state | Dual-System (órfão + atacante) | **Monitor 1s + override determinístico** |
+| Cadência | reativa | 5s cycle | 5s cycle | 5s cycle | **1s (auto-vigilância) + 5s estratégico** |
+| Modelo de ameaça | — | Falha externa | Falha externa | Insider compromise (DDoS) | **Insider compromise (líder)** |
+| Saturação modelada | — | — | — | Sim (líder) | **Sim (AP) — queda terminal** |
+| Recovery | — | Pipeline órfão | Cluster-level + órfão | Pipeline órfão (reativo) | **ForceReelection (banir + re-eleger)** |
 
 ---
 
@@ -450,7 +553,7 @@ python3 -c "
 import glob, csv
 for n in [200, 250, 300]:
     qis = []
-    for f in glob.glob(f'scratch/detective/results-detective/{n}_attack5/run_*/IntuitiveStats.csv'):
+    for f in glob.glob(f'scratch/detective/results-detective/{n}_attack5_mode2/run_*/IntuitiveStats.csv'):
         rows = list(csv.DictReader(open(f)))
         if rows: qis.append(float(rows[-1]['qi']))
     print(f'N={n}: QI final médio = {sum(qis)/len(qis):.4f}  ({len(qis)} runs)')
@@ -486,5 +589,22 @@ for n in [200, 250, 300]:
                                     + CLI flags do detective,
                                     + lifecycle do FloodSaturationThreshold,
                                     - removido: flags de cenário 4/5 do synapt
+```
+
+### Adições da v2 (líder → AP, vs detective-v1)
+
+```
+~~~ constants.h                     + ForceReelection (AP → membros: re-eleger banindo líder)
+~~~ NodeAPApplication.{cc,h}        + saturação do próprio AP (apTotalFloodReceived, apAlive),
+                                    + apFloodMonitorCycle (monitor de 1s) com detecção direta
+                                      e override determinístico (AP_ABS_FLOOR, AP_Z_HARD),
+                                    + sendForceReelection (marca leaderAlive=false + notifica membros),
+                                    + processAPAttackersIntuitively vira telemetria-only,
+                                    + telemetria por delta cumulativo (apIncomingFloodTotal etc.)
+~~~ NodeApplication.{cc,h}          + handler de ForceReelection, blacklistedLeaders,
+                                    + reelectLeader (re-eleição imediata),
+                                    + tiebreakLeader pula líderes banidos
+~~~ contaski.cc                     + attackMode=2 seleciona atacantes entre os líderes
+~~~ run_detective.sh                ± ATTACK_MODE default=2; label inclui o modo (_mode<N>)
 ```
 

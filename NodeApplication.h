@@ -63,6 +63,12 @@ namespace nr2{
             // Populada via MessageTypes::QuarantineOrder vindo do AP.
             std::set<Ipv6Address>                                   quarantinedSources;
 
+            // v2 — Lista de líderes "banidos" pela próxima eleição.
+            // Populada via MessageTypes::ForceReelection do AP quando um líder
+            // foi quarentenado por flodar o AP. tiebreakLeader pula candidatos
+            // nesta lista, garantindo que o líder ruim NÃO seja re-eleito.
+            std::set<Ipv6Address>                                   blacklistedLeaders;
+
         public:
             void setup(capabilitiesVector cap);
             void recvCallback(Ptr<Socket> socket);
@@ -80,6 +86,11 @@ namespace nr2{
             void registerLeader();
 
             Ipv6Address tiebreakLeader();
+
+            // v2 — re-eleição pós-ForceReelection. Análoga a selectAndRegisterLeader
+            // mas com timing imediato (sem o delay de 90.5+delay do clustering inicial)
+            // e idempotente (se o nó re-elege a si mesmo, garante registro único).
+            void reelectLeader();
             void setAPAddress(Ipv6Address ip);
             void dispatchTaskToCluster(string cap);
             int sendMessageHelper(MessageTypes type, Ipv6Address addr, uint8_t* buffer, int size);

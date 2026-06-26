@@ -208,6 +208,12 @@ namespace nr2 {
         // Saturação de líder por flood (modelo de DoS efetivo)
         uint32_t    leadersAlive;              // líderes vivos no clusterInfoMap neste ciclo
         uint32_t    leadersDownThisCycle;      // líderes que caíram desde o ciclo anterior
+
+        // v2 — defesa contra líder atacando o AP
+        uint32_t    apIncomingFloodTotal;      // pacotes flood que o AP recebeu neste ciclo
+        uint32_t    apQuarantinedLeadersCount; // líderes quarentenados pelo AP até agora (cum)
+        uint32_t    forcedReelectionsThisCycle;// re-eleições disparadas neste ciclo
+        bool        apAliveSnapshot;           // o AP ainda está vivo?
     };
 
     // Informação que o AP mantém sobre cada cluster

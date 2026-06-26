@@ -764,6 +764,10 @@ namespace nr2 {
         snap.smartRedundancyOk    = 0;
         snap.leadersAlive         = 0;  // AP preenche depois
         snap.leadersDownThisCycle = 0;  // AP preenche depois
+        snap.apIncomingFloodTotal       = 0;  // AP preenche depois (v2)
+        snap.apQuarantinedLeadersCount  = 0;  // idem
+        snap.forcedReelectionsThisCycle = 0;  // idem
+        snap.apAliveSnapshot            = true; // default; AP atualiza se cair
         snap.qAttackerDoNothingHigh  = attackerSys.getQ(ATK_SUSPECT_HIGH, ATK_DO_NOTHING);
         snap.qAttackerQuarantineHigh = attackerSys.getQ(ATK_SUSPECT_HIGH, ATK_QUARANTINE);
         snap.qAttackerDoNothingLow   = attackerSys.getQ(ATK_SUSPECT_LOW,  ATK_DO_NOTHING);

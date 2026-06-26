@@ -73,13 +73,14 @@ fi
 # ============================================================
 SCALES=(${SCALES:-200 250 300})            # tamanhos de rede a testar
 N_RUNS="${N_RUNS:-35}"                      # rodadas cumulativas por scale
-N_ATTACKERS="${N_ATTACKERS:-5}"             # atacantes por run
-ATTACK_MODE="${ATTACK_MODE:-1}"             # 1=membro→líder
+N_ATTACKERS="${N_ATTACKERS:-5}"             # atacantes por run (5*50=250pkts/s < SAT_THRESHOLD: AP sobrevive)
+ATTACK_MODE="${ATTACK_MODE:-2}"             # v2: 2=líder→AP (1=membro→líder é a v1)
 ATTACK_START="${ATTACK_START:-300.0}"
 ATTACK_RATE="${ATTACK_RATE:-50.0}"
 ATTACK_PAYLOAD="${ATTACK_PAYLOAD:-64}"
-SAT_THRESHOLD="${SAT_THRESHOLD:-500}"       # pacotes pra líder cair
-SCENARIO_LABEL="${SCENARIO_LABEL:-attack${N_ATTACKERS}}"
+SAT_THRESHOLD="${SAT_THRESHOLD:-500}"       # pacotes pra vítima (líder em v1 / AP em v2) cair
+# Label inclui o modo pra não colidir mode1 (attack5) com mode2 (attack5_mode2).
+SCENARIO_LABEL="${SCENARIO_LABEL:-attack${N_ATTACKERS}_mode${ATTACK_MODE}}"
 
 # Parse args simples
 case "${1:-}" in
