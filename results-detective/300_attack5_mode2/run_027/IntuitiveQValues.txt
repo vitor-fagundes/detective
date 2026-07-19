@@ -1,8 +1,8 @@
 === Q-VALORES FINAIS (4x3) ===
 Estado EXISTING_VIABLE:
-  DO_NOTHING: 0
-  REALLOCATE_TO_EXISTING: 0
-  RECLUSTER_ORPHANS: 0
+  DO_NOTHING: 42.8032
+  REALLOCATE_TO_EXISTING: 92.0405
+  RECLUSTER_ORPHANS: 99.9999
 Estado ORPHAN_ONLY:
   DO_NOTHING: 0
   REALLOCATE_TO_EXISTING: 0
@@ -11,20 +11,20 @@ Estado NO_MATCH:
   DO_NOTHING: 0
   REALLOCATE_TO_EXISTING: 0
   RECLUSTER_ORPHANS: 0
-Epsilon final: 0.15
-S1 count total: 0
-S2 count total: 0
+Epsilon final: 0.0620118
+S1 count total: 1294
+S2 count total: 53
 
 === Q-VALORES FINAIS DO RAMO ATACANTE (3x2) ===
 Estado CLEAR:
   DO_NOTHING: 0
   QUARANTINE: 0
 Estado SUSPECT_LOW:
-  DO_NOTHING: 0.36
+  DO_NOTHING: 0
   QUARANTINE: 0
 Estado SUSPECT_HIGH:
   DO_NOTHING: 0
-  QUARANTINE: 9.51056
-Epsilon atacante final: 0.0404832
+  QUARANTINE: 3.5015
+Epsilon atacante final: 0.0417356
 Quarantine count total: 0
-DoNothing count total:  2
+DoNothing count total:  0

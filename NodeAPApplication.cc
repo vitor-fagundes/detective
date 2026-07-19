@@ -229,6 +229,14 @@ namespace nr2{
             switch (tag.GetSimpleValue()){
                 case MessageTypes::LeaderRegister:
                 {
+                    // v2 (Opção A): um líder quarentenado permanece ejetado. Ignora
+                    // seu (re)registro pra não ressuscitar o cluster (leaderAlive
+                    // voltaria a true), o que o tiraria do pipeline de órfãos que
+                    // recupera seus membros.
+                    if (globallyQuarantined.count(fromIP) > 0) {
+                        NS_LOG_INFO("LR_IGNORED (quarantined): " << fromIP);
+                        break;
+                    }
                     NS_LOG_INFO("LR: " << fromIP << " at " << Simulator::Now().GetSeconds());
                     this->clusterLeaders->push_back(fromIP);
 
@@ -274,6 +282,9 @@ namespace nr2{
                     break;
                 case MessageTypes::HeartbeatReport:
                 {
+                    // v2 (Opção A): ignora heartbeat de líder quarentenado pra ele
+                    // não refrescar liveness e se des-ejetar.
+                    if (globallyQuarantined.count(fromIP) > 0) break;
                     // Heartbeat confirma que o líder está vivo
                     // memberCount é calculado via myLeader no intuitiveDecisionCycle
                     auto it = clusterInfoMap.find(fromIP);
@@ -522,12 +533,18 @@ namespace nr2{
                     leaderNode->GetApplication(0));
                 if(leaderApp){
                     bool wasAlive = entry.second.leaderAlive;
-                    bool nowAlive = leaderApp->isNodeAlive();
+                    // v2 (Opção A): um líder quarentenado está EJETADO do serviço
+                    // mesmo com o nó vivo (quarentena != saturação). Tratamos como
+                    // morto pra que (i) seus membros virem órfãos e sejam recuperados
+                    // pelo pipeline (REALLOCATE) e (ii) ele não seja ressuscitado na
+                    // recontagem de liveness deste ciclo.
+                    bool nowAlive = leaderApp->isNodeAlive()
+                                    && (globallyQuarantined.count(leaderAddr) == 0);
                     if(wasAlive && !nowAlive){
                         downThisCycle++;
                         NS_LOG_INFO("LEADER_DETECTED_DOWN: " << leaderAddr
                                     << " at t=" << now
-                                    << " (provável saturação por flood)");
+                                    << " (saturação por flood ou quarentena)");
                     }
                     entry.second.leaderAlive = nowAlive;
                 }
@@ -1524,12 +1541,20 @@ namespace nr2{
                             << (hardOverride ? " (HARD_OVERRIDE)" : ""));
 
                 if (action == ATK_QUARANTINE) {
-                    // Quarentena no AP = drop local + force re-election do cluster.
+                    // v2 (Opção A): ejeta o líder comprometido e deixa o pipeline de
+                    // órfãos (REALLOCATE/RECLUSTER) recuperar os membros — o mesmo
+                    // caminho provado do v1. Marcamos o cluster como morto e
+                    // quarentenamos a origem (o AP passa a dropar o flood dela no
+                    // recvCallback). NÃO re-apontamos os membros: eles mantêm
+                    // myLeader==suspect, então processOrphansIntuitively os detecta
+                    // como órfãos no próximo ciclo estratégico e realoca pra clusters
+                    // vizinhos vivos, fazendo o SR recuperar.
                     apQuarantinedLeaders.insert(suspect);
                     globallyQuarantined[suspect] = Simulator::Now().GetSeconds();
+                    auto cit = clusterInfoMap.find(suspect);
+                    if (cit != clusterInfoMap.end()) cit->second.leaderAlive = false;
                     NS_LOG_INFO("AP_QUARANTINE_LEADER: " << suspect
-                                << " — drop local + force re-election do cluster");
-                    sendForceReelection(suspect);
+                                << " — ejetado; membros recuperados via pipeline de orfaos");
                 }
 
                 PendingDecision pd{state, action, apAddr};
@@ -1555,6 +1580,9 @@ namespace nr2{
         apSuspectsAccum = apQuarAccum = apDoNothingAccum = 0;
     }
 
+    // OBSOLETO (Opção A): não é mais chamado. A recuperação da v2 migrou pro
+    // pipeline de órfãos (REALLOCATE/RECLUSTER), que não estrandava os membros.
+    // Mantido só como referência histórica do caminho de re-eleição.
     void NodeAPApplication::sendForceReelection(Ipv6Address badLeader) {
         // Marca o líder ruim como morto no clusterInfoMap pra evitar dispatch
         // de tarefas. O nó em si continua "vivo" mas isolado pela quarentena.
