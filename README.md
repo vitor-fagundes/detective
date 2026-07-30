@@ -21,6 +21,8 @@ A arquitetura mantém o motor de aprendizado intuitivo do SYNAPT (Dual-System S1
 
 Quando a quarentena é rápida o suficiente, o líder sobrevive. Quando o atacante satura antes da detecção, o líder cai e o pipeline de órfãos do SYNAPT entra em ação para reabsorver os membros saudáveis em clusters vizinhos.
 
+**Cenários avaliados no paper**: dois determinísticos (**N=200** e **N=250**, 5 atacantes fixos em `t=300s`) e um **FR (Full Random, N=200)** em que início, quantidade e escolha dos atacantes são aleatórios por rodada. Ver [Cenário FR](#cenário-fr-full-random). *(N=300 existe no código — `THRESHOLD_S1_300`, `ξ` para N≥300 — mas foi retirado do paper.)*
+
 ---
 
 ## Arquitetura
@@ -40,7 +42,10 @@ capabilities.cc/h        — Vetores de capacidades e similaridade (Eq. 1 do CON
 task.cc/h                — Modelo de tarefas com capacidades requeridas e quorum
 constants.h              — Enum de tipos de mensagem (inclui FloodPacket, QuarantineOrder)
 MyTag.cc/h               — Tag NS-3 para identificação de tipo de mensagem UDP
-run_detective.sh         — Script de execução cumulativa para o paper (3 scales × 35 runs)
+run_detective.sh         — Script de execução cumulativa determinística (scales × 35 runs)
+run_detective_fr.sh      — Script do cenário FR (Full Random): tudo aleatório por run, N=200
+plots/                   — Scripts de geração das figuras + tabelas do paper:
+                           gen_results2.py, gen_learning_extra.py, compute_tables.py
 ```
 
 ---
@@ -300,6 +305,55 @@ N_ATTACKERS=10 SAT_THRESHOLD=750 ./scratch/detective/run_detective.sh
 
 ---
 
+## Cenário FR (Full Random)
+
+Além dos cenários determinísticos (5 atacantes fixos em `t=300s`), o DETECTIVE inclui o cenário **FR (Full Random)** para o paper, em que **tudo é aleatório por rodada**:
+
+| Dimensão | Sorteio (por run) |
+|---|---|
+| Início do ataque | uniforme em **[200, 700] s** (sempre após o warmup completo, `t≈160`) |
+| Nº de atacantes | uniforme em **[5, 20]** = 2.5%–10% de N=200 |
+| Quais nós | sorteio uniforme interno (`std::random_device`) |
+
+Escala única **N=200**, v1 (membro→líder), 35 runs cumulativos. Os parâmetros sorteados de cada run são gravados em `attack_manifest.csv` (`run, attack_start, n_attackers`) para reprodutibilidade/auditoria.
+
+```bash
+# FR completo (35 runs)
+./scratch/detective/run_detective_fr.sh fr
+
+# Smoke (3 runs)
+./scratch/detective/run_detective_fr.sh fr quick
+
+# Overrides via env var
+N_RUNS=10 ./scratch/detective/run_detective_fr.sh fr
+```
+
+Saída em `results-detective/200_fr/` (mesma estrutura das outras + `attack_manifest.csv`).
+
+**Por que o recall cai com a intensidade** — a detecção usa Z-score **relativo intra-cluster** + threshold absoluto. Com mais atacantes por cluster, o líder satura (500 pkts) **antes** do ciclo de decisão de 5s conseguir quarentenar → o atacante "vence a corrida" e vira um falso-negativo. Não é falha de detecção (a defesa sempre percebe o ataque, DR=100%), é limite temporal. Mesmo assim o serviço se recupera: no FR a recuperação é dominada por **RECLUSTER** (97/run vs 6 de REALLOCATE), ao contrário dos determinísticos que são 100% REALLOCATE — porque muitos líderes caem juntos e não sobra vizinho saudável para absorver os órfãos.
+
+---
+
+## Plots e Figuras
+
+A pasta `plots/` gera as figuras e tabelas do paper (fontes no estilo synapt: DejaVu Sans, corpo grande, bordas visíveis):
+
+| Script | Gera |
+|---|---|
+| `gen_results2.py` | 4 painéis A/B/C/D — QI **(A)** e SR **(B)** alinhados ao ataque; ε **(C)** e Q(QUARANTINE) **(D)** por run cumulativo — 3 séries (N=200, N=250, FR); + `fig_recovery_summary` |
+| `gen_learning_extra.py` | `fig_decision_margin` (Q-QUARANTINE vs Q-DoNothing, FR) e `fig_radar` (eficácia/convergência/preferência por faixa de intensidade) |
+| `compute_tables.py` | valores das tabelas de rede e de segurança (matriz de confusão pooled, ADT/AMT/Trec); reproduz o baseline publicado exatamente |
+
+Figuras em `plots/figures/` (`.pdf` + `.png`), dados em `plots/data/`.
+
+```bash
+python3 plots/gen_results2.py        # figuras A-D + recovery
+python3 plots/gen_learning_extra.py  # decision margin + radar
+python3 plots/compute_tables.py      # tabelas (rede + segurança)
+```
+
+---
+
 ## Estrutura de Saída
 
 ```
@@ -317,7 +371,11 @@ scratch/detective/results-detective/
 │   ├── run_002/
 │   └── ...
 ├── 250_attack5/
-└── 300_attack5/
+├── 300_attack5/
+└── 200_fr/                                     (cenário FR — Full Random)
+    ├── knowledge.dat
+    ├── attack_manifest.csv                     (run, attack_start, n_attackers — params sorteados)
+    ├── run_001/ ...
 ```
 
 ### Colunas do `IntuitiveStats.csv`
@@ -346,6 +404,18 @@ Validação completa com 35 runs cumulativos para N={200, 250, 300}, 5 atacantes
 | N=200 | 175 | 139 | **79.4%** |
 | N=250 | 165 | 123 | **74.5%** |
 | N=300 | 175 | 146 | **83.4%** |
+
+### Métricas de segurança (matriz de confusão, paper)
+
+Confusão por nó, agregada (pooled) sobre as 35 runs. **DR** = fração de ataques com ≥1 detecção; **Recall** = TP/(TP+FN) por nó atacante. Gerado por `plots/compute_tables.py`.
+
+| Cenário | ACC | DR | Recall | PRE | FPR | F1 | ADT | AMT | T_rec |
+|---|---|---|---|---|---|---|---|---|---|
+| N=200 | 99.49% | 100% | 79.43% | 100% | 0% | 88.54% | 5.9s | 0.1s | 7.0s |
+| N=250 | 99.49% | 100% | 74.55% | 100% | 0% | 85.42% | 5.2s | 0.3s | 7.7s |
+| **200 (FR)** | 96.41% | 100% | 41.63% | 100% | 0% | 58.78% | 8.8s | 0.3s | 8.6s |
+
+**FP = 0 em todas as runs** → Precision 100%, nenhum nó legítimo quarentenado. O recall < 100% vem de atacantes que saturam o líder antes da quarentena (limite temporal — ver [Cenário FR](#cenário-fr-full-random)). Recall por faixa de intensidade no FR: leve (5-8 atk) **84%**, médio (9-14) **47%**, pesado (15-20) **25%** — mas o SR final se mantém ~94% nas três (auto-recuperação robusta à intensidade). AMT ≈ 0.1-0.3s porque a quarentena é emitida no **mesmo ciclo** da detecção.
 
 ### Saturação (race condition)
 
