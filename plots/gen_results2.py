@@ -181,7 +181,9 @@ def plot_attacker_qquar(summary, order_colors, fname, title=None):
             continue
         ax.plot(sub['run'], sub['atk_qquar'], color=color, linewidth=2, marker='o',
                 markersize=3, label=label)
-    ax.set_xlabel('Cumulative run'); ax.set_ylabel('Atk Q(QUARANTINE)')
+    ax.set_xlabel('Cumulative run'); ax.set_ylabel('Q(QUARANTINE)')
+    ax.set_ylim(0, 21); ax.set_yticks([0, 5, 10, 15, 20])
+    ax.set_xlim(1, 35); ax.set_xticks([1, 5, 10, 15, 20, 25, 30, 35])
     ax.legend(loc='lower right')
     _save(fig, fname)
 
@@ -196,7 +198,9 @@ def plot_attacker_epsilon(summary, order_colors, fname, title=None):
             continue
         ax.plot(sub['run'], sub['atk_epsilon'], color=color, linewidth=2, marker='o',
                 markersize=3, label=label)
-    ax.set_xlabel('Cumulative run'); ax.set_ylabel('Atk exploration (ε)')
+    ax.set_xlabel('Cumulative run'); ax.set_ylabel('Exploration (ε)')
+    ax.set_ylim(top=0.16); ax.set_yticks([0.05, 0.10, 0.15])
+    ax.set_xlim(1, 35); ax.set_xticks([1, 5, 10, 15, 20, 25, 30, 35])
     ax.legend(loc='upper right')
     _save(fig, fname)
 
@@ -247,8 +251,8 @@ def main():
     summary.to_csv(os.path.join(DATA, 'summary_runs.csv'), index=False)
 
     print('\nGerando figuras...')
-    plot_aligned(aligned, order_colors, 'qi', 'Quality Index', 'fig_qi_attack', title='(A)')
-    plot_aligned(aligned, order_colors, 'sr', 'Service Reachability', 'fig_sr_attack', title='(B)')
+    plot_aligned(aligned, order_colors, 'qi', 'QI', 'fig_qi_attack', title='(A)')
+    plot_aligned(aligned, order_colors, 'sr', 'SR', 'fig_sr_attack', title='(B)')
     plot_attacker_epsilon(summary, order_colors, 'fig_attacker_epsilon', title='(C)')
     plot_attacker_qquar(summary, order_colors, 'fig_attacker_qquar', title='(D)')
     plot_recovery_summary(summary, order_colors, 'fig_recovery_summary')
