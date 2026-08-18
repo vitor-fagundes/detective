@@ -48,6 +48,10 @@ int main (int argc, char *argv[]){
 	// Persistência do aprendizado intuitivo entre rodadas
 	std::string knowledgePath = "";  // Vazio = sem persistência
 
+	// Motor de recuperação: "intuitive" (default) ou "qlearning" (baseline sectional-style).
+	// No modo qlearning NÃO há detecção/quarentena — só recuperação de órfãos via Q-learning puro.
+	std::string recoveryEngine = "intuitive";
+
 	// Parâmetros de ataque UDP flood (insider threat — cenário central do detective)
 	uint32_t nAttackers = 0;              // Número de nós comprometidos (0 = sem ataque)
 	double attackStartTime = 300.0;       // Tempo de início do flood (s)
@@ -61,6 +65,7 @@ int main (int argc, char *argv[]){
 	cmd.AddValue ("run", "Run number", run);
 	cmd.AddValue ("decisionInterval", "Intuitive learning decision cycle interval in seconds", decisionInterval);
 	cmd.AddValue ("knowledgePath", "Path to intuitive knowledge file (load/save between runs)", knowledgePath);
+	cmd.AddValue ("recoveryEngine", "Recovery engine: intuitive (default) | qlearning (baseline, no quarantine)", recoveryEngine);
 	cmd.AddValue ("nAttackers", "Number of compromised nodes for UDP flood (0 = no attack)", nAttackers);
 	cmd.AddValue ("attackStartTime", "Time to start UDP flood (seconds)", attackStartTime);
 	cmd.AddValue ("attackRate", "Flood packet rate (packets/second)", attackRate);
@@ -172,6 +177,7 @@ int main (int argc, char *argv[]){
 	apApplication->setTotalNodes(nNodes);
 	apApplication->setDecisionInterval(decisionInterval);
 	apApplication->setKnowledgePath(knowledgePath);
+	apApplication->setRecoveryEngine(recoveryEngine);
 
 	// Configurar ataque UDP flood — seleção de atacantes feita externamente ao AP
 	// (operador do experimento), agendada para t=200s após estabilização do

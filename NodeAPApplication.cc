@@ -5,6 +5,7 @@
 #include "ns3/udp-socket-factory.h"
 #include "MyTag.h"
 #include "constants.h"
+#include "QLearningAgent.h"   // baseline Q-learning (modo --recoveryEngine=qlearning)
 
 #include <iostream>
 #include <algorithm>
@@ -95,6 +96,18 @@ namespace nr2{
             this->intuitiveEngine->loadKnowledge(this->knowledgePath);
         }
 
+        // Baseline Q-learning: instanciar o agente e carregar a Q-table cumulativa.
+        // No modo qlearning NÃO há detecção/quarentena — só recuperação via Q puro.
+        if(this->recoveryEngine == "qlearning"){
+            this->qlAgent = new qlbaseline::QLearningAgent(0.2, 0.9, 0.15); // paridade ALPHA_Q/GAMMA_Q/ε
+            if(!this->knowledgePath.empty()){
+                this->qlTablePath = this->knowledgePath + ".qltable";
+                this->qlAgent->loadQTable(this->qlTablePath);
+            }
+            NS_LOG_INFO("RECOVERY_ENGINE: qlearning (baseline, SEM quarentena) — Q-table em "
+                        << this->qlTablePath);
+        }
+
         // ============================================================
         // Agendar primeiro ciclo de decisão do aprendizado intuitivo
         // Líderes registram em t=105s; ciclo começa em t=115s (antes do primeiro dispatch em t=150s)
@@ -125,6 +138,11 @@ namespace nr2{
         // Salvar conhecimento persistente para próxima rodada
         if(!this->knowledgePath.empty()){
             this->intuitiveEngine->saveKnowledge(this->knowledgePath);
+        }
+
+        // Baseline Q-learning: persistir Q-table cumulativa entre rodadas
+        if(this->qlAgent && !this->qlTablePath.empty()){
+            this->qlAgent->saveQTable(this->qlTablePath);
         }
     }
 
@@ -549,10 +567,23 @@ namespace nr2{
         // [4.5] Fase 2 — defesa contra UDP flooder (membro→líder)
         // Roda antes do processamento de órfãos pra que a próxima rodada já veja o
         // efeito da quarentena (e o líder talvez deixe de ser anômalo).
-        processAttackersIntuitively(snap);
+        // BASELINE QLEARNING (escopo a): sem detecção/quarentena — só recuperação.
+        if(this->recoveryEngine != "qlearning"){
+            processAttackersIntuitively(snap);
+        }
+
+        // Baseline QL: registrar ε do agente na telemetria (coluna atkEpsilon) antes do push
+        if(this->recoveryEngine == "qlearning" && qlAgent){
+            snap.attackerEpsilon = qlAgent->getEpsilon();
+        }
 
         // [5] Processar órfãos com decisão individual por órfão
         processOrphansIntuitively(snap);
+
+        // Baseline QL: decair ε após o ciclo (só se houve órfãos), igual ao intuitivo
+        if(this->recoveryEngine == "qlearning" && qlAgent){
+            qlAgent->decayEpsilon((int)snap.totalOrphans);
+        }
 
         // [6] Recalcular métricas após ação via myLeader
         for(auto& entry : clusterInfoMap){
@@ -785,11 +816,23 @@ namespace nr2{
             OrphanState orphanState = DualSystemResponse::determineOrphanState(
                 bestSimExisting, simOrphans, REALLOCATION_THRESHOLD, CLUSTERING_THRESHOLD);
 
-            // [4d] S1/S2 escolhe ação para este órfão
-            auto result = dualSys.chooseActionForOrphan(
-                knowledge, distLearn, qi, sr, pThreat, orphanState);
-            IntuitiveAction action = result.first;
-            SystemUsed system = result.second;
+            // [4d] Escolher ação — intuitivo (default) OU Q-learning baseline
+            IntuitiveAction action;
+            SystemUsed system = SYSTEM_S2;
+            qlbaseline::State qlState = qlbaseline::SIM_BOTH_MEDIUM;  // visível em [4g]
+            if(this->recoveryEngine == "qlearning"){
+                // Q-learning puro: estado por 2 similaridades, ε-greedy, sem S1/netLearning
+                qlState = qlAgent->determineState(bestSimExisting, simOrphans);
+                qlbaseline::Action qa = qlAgent->chooseAction(qlState);
+                action = (qa == qlbaseline::REALLOCATE_EXISTING) ? REALLOCATE_TO_EXISTING
+                       : (qa == qlbaseline::FORM_NEW_CLUSTER)    ? RECLUSTER_ORPHANS
+                       :                                          DO_NOTHING;
+            } else {
+                auto result = dualSys.chooseActionForOrphan(
+                    knowledge, distLearn, qi, sr, pThreat, orphanState);
+                action = result.first;
+                system = result.second;
+            }
 
             // [4e] Validar viabilidade e aplicar fallback (como RL3)
             bool existingViable = (bestSimExisting >= REALLOCATION_THRESHOLD && bestClusterIdx >= 0);
@@ -855,10 +898,18 @@ namespace nr2{
                             << "] → DO_NOTHING [" << SystemUsedNames[system] << "]");
             }
 
-            // [4g] Atualizar Q-Table e Rintuitive para este órfão
-            dualSys.updateQForOrphan(orphanState, action, reward);
-            std::string bucket = OrphanStateNames[orphanState];
-            knowledge.updateIntuitive(bucket, action, reward);
+            // [4g] Atualizar — intuitivo (Q-table órfão + Rintuitive) OU Q-learning baseline
+            if(this->recoveryEngine == "qlearning"){
+                qlbaseline::Action qaTaken =
+                      (action == REALLOCATE_TO_EXISTING) ? qlbaseline::REALLOCATE_EXISTING
+                    : (action == RECLUSTER_ORPHANS)      ? qlbaseline::FORM_NEW_CLUSTER
+                    :                                      qlbaseline::DO_NOT_ALLOCATE;
+                qlAgent->updateQTable(qlState, qaTaken, reward, qlState);
+            } else {
+                dualSys.updateQForOrphan(orphanState, action, reward);
+                std::string bucket = OrphanStateNames[orphanState];
+                knowledge.updateIntuitive(bucket, action, reward);
+            }
 
             if(!resolved){
                 stillOrphaned.push_back(orphan.addr);

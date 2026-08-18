@@ -12,6 +12,8 @@
 
 using namespace ns3;
 
+namespace qlbaseline { class QLearningAgent; }  // baseline Q-learning (modo --recoveryEngine=qlearning)
+
 namespace nr2{
     class NodeApplication;  // Forward declaration
 
@@ -64,6 +66,10 @@ namespace nr2{
 
             // Caminho para o arquivo de conhecimento persistente entre rodadas
             std::string                 knowledgePath;
+            // --- Baseline Q-learning (comparação; modo --recoveryEngine=qlearning) ---
+            std::string                 recoveryEngine = "intuitive"; // "intuitive" (default) | "qlearning"
+            qlbaseline::QLearningAgent* qlAgent = nullptr;            // instanciado só no modo qlearning
+            std::string                 qlTablePath;                  // persistência da Q-table baseline
 
             // RNG reutilizável para Li inicial de líderes (LeaderRegister)
             Ptr<UniformRandomVariable>  m_liRng;
@@ -114,6 +120,7 @@ namespace nr2{
 
             // Configurar caminho do arquivo de conhecimento persistente
             void setKnowledgePath(const std::string& path) { this->knowledgePath = path; }
+            void setRecoveryEngine(const std::string& eng) { this->recoveryEngine = eng; }
 
             // Ciclo periódico de decisão do aprendizado intuitivo
             void intuitiveDecisionCycle();
